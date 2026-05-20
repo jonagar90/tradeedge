@@ -89,8 +89,6 @@ function checkEntry(ticker,price,settings){
   const s=orbState[ticker];
   const {minsFromOpen,h,m}=getEST();
   // Time filter
-  const cutoffMins=(settings.noEntryAfterHour-9)*60+(settings.noEntryAfterMin-30);
-  if(minsFromOpen>cutoffMins) return{pass:false,reason:`After ${settings.noEntryAfterHour}:${String(settings.noEntryAfterMin).padStart(2,"0")} EST cutoff`};
   if(minsFromOpen<0) return{pass:false,reason:"Market not open yet"};
   // In simulation mode (outside market hours) bypass ORB requirement
   const simMode=minsFromOpen<0||minsFromOpen>390;
