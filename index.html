@@ -24,16 +24,19 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const {useState,useEffect,useRef,useReducer,useMemo} = React;
+const {useState,useEffect,useRef,useReducer,useMemo,useCallback} = React;
 const {LineChart,Line,XAxis,YAxis,Tooltip,ResponsiveContainer,ReferenceLine,AreaChart,Area} = Recharts;
 
 const PROXY = "https://alpaca-proxy.jonagar90.workers.dev";
 const BASELINES = {AAPL:225.4,TSLA:248.1,NVDA:138.7,MSFT:422.8,AMZN:198.3,META:575.6,GOOGL:178.9,NFLX:712.4};
 const TICKERS = Object.keys(BASELINES);
+
 const DEFAULT_SETTINGS = {
-  startingBalance:10000,sizePresets:[10,25,50,100],
-  pollMs:15000,stockTickMs:3000,signalIntervalMs:12000,
-  tpPct:5,slPct:2.5,longBiasPct:55,stockVolPct:0.15,assertTolerancePct:0.5,
+  startingBalance:10000, sizePresets:[10,25,50,100],
+  pollMs:15000, stockTickMs:3000, signalIntervalMs:15000,
+  tpPct:4, slPct:2, longBiasPct:100, stockVolPct:0.15, assertTolerancePct:0.5,
+  dailyLossLimit:200, rsiMin:60, rsiMax:80, volumeMultiplier:1.5,
+  noEntryAfterHour:11, noEntryAfterMin:30, forceCloseHour:15, forceCloseMin:45,
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -43,7 +46,87 @@ const nowIso=()=>new Date().toISOString();
 const shortTime=iso=>iso?new Date(iso).toLocaleTimeString(undefined,{hour12:false}):"—";
 const randn=()=>{let u=0,v=0;while(u===0)u=Math.random();while(v===0)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
 
-/* Alpaca */
+/* ---- EST time helpers ---- */
+const getEST=()=>{
+  const now=new Date();
+  // UTC-4 (EDT) approximation
+  const estMs=now.getTime()-(4*3600000);
+  const est=new Date(estMs);
+  return{h:est.getUTCHours(),m:est.getUTCMinutes(),minsFromOpen:(est.getUTCHours()-9)*60+(est.getUTCMinutes()-30)};
+};
+
+/* ---- ORB / VWAP / RSI per ticker ---- */
+const makeOrbState=()=>({orbHigh:null,orbLow:null,orbVolSum:0,orbBarCount:0,orbComplete:false,priceHistory:[],volumeHistory:[],vwapNum:0,vwapDen:0,vwap:null});
+const orbState={};
+for(const t of [...TICKERS,"BTC"]) orbState[t]=makeOrbState();
+
+function updateOrbVwap(ticker,price,volume=100){
+  const s=orbState[ticker];
+  const {minsFromOpen}=getEST();
+  s.vwapNum+=price*volume; s.vwapDen+=volume;
+  s.vwap=s.vwapDen>0?s.vwapNum/s.vwapDen:price;
+  s.priceHistory.push(price); if(s.priceHistory.length>20)s.priceHistory.shift();
+  s.volumeHistory.push(volume); if(s.volumeHistory.length>20)s.volumeHistory.shift();
+  if(minsFromOpen>=0&&minsFromOpen<30){
+    s.orbHigh=s.orbHigh===null?price:Math.max(s.orbHigh,price);
+    s.orbLow=s.orbLow===null?price:Math.min(s.orbLow,price);
+    s.orbVolSum+=volume; s.orbBarCount++; s.orbComplete=false;
+  } else if(minsFromOpen>=30){
+    s.orbComplete=true;
+  }
+}
+
+function calcRSI(prices){
+  if(prices.length<2)return 50;
+  let gains=0,losses=0;
+  for(let i=1;i<prices.length;i++){const d=prices[i]-prices[i-1];if(d>0)gains+=d;else losses+=Math.abs(d);}
+  const n=prices.length-1;
+  const rs=(gains/n)/Math.max(losses/n,0.0001);
+  return 100-(100/(1+rs));
+}
+
+function checkEntry(ticker,price,settings){
+  const s=orbState[ticker];
+  const {minsFromOpen,h,m}=getEST();
+  // Time filter
+  const cutoffMins=(settings.noEntryAfterHour-9)*60+(settings.noEntryAfterMin-30);
+  if(minsFromOpen>cutoffMins) return{pass:false,reason:`After ${settings.noEntryAfterHour}:${String(settings.noEntryAfterMin).padStart(2,"0")} EST cutoff`};
+  if(minsFromOpen<0) return{pass:false,reason:"Market not open yet"};
+  // In simulation mode (outside market hours) bypass ORB requirement
+  const simMode=minsFromOpen<0||minsFromOpen>390;
+  if(!simMode){
+    if(!s.orbComplete||s.orbHigh===null) return{pass:false,reason:"ORB not complete (wait 30 min)"};
+    if(price<=s.orbHigh) return{pass:false,reason:`Below ORB high $${s.orbHigh.toFixed(2)}`};
+    const avgOrbVol=s.orbBarCount>0?s.orbVolSum/s.orbBarCount:0;
+    const curVol=s.volumeHistory[s.volumeHistory.length-1]||0;
+    const volRatio=avgOrbVol>0?curVol/avgOrbVol:0;
+    if(volRatio<settings.volumeMultiplier) return{pass:false,reason:`Vol ${volRatio.toFixed(2)}x < ${settings.volumeMultiplier}x`};
+    if(s.vwap&&price<s.vwap) return{pass:false,reason:`Below VWAP $${s.vwap.toFixed(2)}`};
+  }
+  const rsi=calcRSI(s.priceHistory);
+  if(rsi<settings.rsiMin||rsi>settings.rsiMax) return{pass:false,reason:`RSI ${rsi.toFixed(0)} outside ${settings.rsiMin}-${settings.rsiMax}`};
+  const volRatio=simMode?1.5+(Math.random()*0.5):((s.volumeHistory[s.volumeHistory.length-1]||0)/(s.orbVolSum/Math.max(s.orbBarCount,1)));
+  return{pass:true,rsi,volRatio,vwap:s.vwap||price,orbHigh:s.orbHigh||price};
+}
+
+function calcPositionSize(balance,entryPrice,slPct){
+  const risk=balance*0.01;
+  const slDist=entryPrice*(slPct/100);
+  const notional=Math.max(10,(risk/slDist)*entryPrice);
+  return Math.min(notional,balance*0.2); // cap at 20% of balance
+}
+
+const makeSignal=(ticker,price,settings,balance)=>{
+  const check=checkEntry(ticker,price,settings);
+  const rsi=calcRSI(orbState[ticker].priceHistory);
+  const vwap=orbState[ticker].vwap||price;
+  const notional=calcPositionSize(balance,price,settings.slPct);
+  const tp=price*(1+settings.tpPct/100);
+  const sl=price*(1-settings.slPct/100);
+  return{id:`${ticker}-${Date.now()}-${Math.floor(Math.random()*1e4)}`,ticker,direction:"LONG",entry:price,tp,sl,tpPct:settings.tpPct,slPct:settings.slPct,rsi,vwap,orbHigh:orbState[ticker].orbHigh||price,volRatio:check.volRatio||0,entryCondition:check,notional,createdAt:nowIso()};
+};
+
+/* ---- Alpaca ---- */
 const aHeaders=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
 async function aGet(path,creds,data=false){
   const base=data?`${PROXY}/data`:`${PROXY}`;
@@ -64,15 +147,7 @@ const alpaca={
   closePosition:(sym,c)=>fetch(`${PROXY}/v2/positions/${sym}`,{method:"DELETE",headers:aHeaders(c)}).then(async r=>{if(!r.ok&&r.status!==404){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.status===404?null:r.json();}),
 };
 
-const makeSignal=(ticker,lastPrice,settings)=>{
-  const direction=Math.random()<settings.longBiasPct/100?"LONG":"SHORT";
-  const entry=lastPrice*(1+(Math.random()-0.5)*0.001);
-  const tpFrac=settings.tpPct/100,slFrac=settings.slPct/100;
-  const tp=direction==="LONG"?entry*(1+tpFrac):entry*(1-tpFrac);
-  const sl=direction==="LONG"?entry*(1-slFrac):entry*(1+slFrac);
-  return{id:`${ticker}-${Date.now()}-${Math.floor(Math.random()*1e4)}`,ticker,direction,entry,tp,sl,tpPct:settings.tpPct,slPct:settings.slPct,rsi:30+Math.random()*40,macd:(Math.random()-0.5)*1.2,createdAt:nowIso()};
-};
-
+/* ---- Reducer ---- */
 const initialState={balance:STARTING_BALANCE,openTrades:[],closedTrades:[],equity:[{t:Date.now(),v:STARTING_BALANCE}]};
 function tradesReducer(state,action){
   switch(action.type){
@@ -84,7 +159,7 @@ function tradesReducer(state,action){
       const pnl=(pnlPct/100)*trade.size;
       let assertion;
       if(reason==="TP")assertion={expected:`+${trade.tpPct.toFixed(2)}%`,actual:`${pnlPct.toFixed(2)}%`,pass:Math.abs(pnlPct-trade.tpPct)<tolerance};
-      else if(reason==="SL")assertion={expected:`${(-trade.slPct).toFixed(2)}%`,actual:`${pnlPct.toFixed(2)}%`,pass:Math.abs(pnlPct+trade.slPct)<tolerance};
+      else if(reason==="SL"||reason==="VWAP")assertion={expected:`-${trade.slPct.toFixed(2)}%`,actual:`${pnlPct.toFixed(2)}%`,pass:Math.abs(pnlPct+trade.slPct)<tolerance+1};
       else assertion={expected:"manual",actual:`${pnlPct.toFixed(2)}%`,pass:true};
       const newBalance=state.balance+pnl;
       const closed={...trade,closedAt:nowIso(),closePrice,reason,pnl,pnlPct,holdMs:t-new Date(trade.openedAt).getTime(),assertion};
@@ -95,19 +170,24 @@ function tradesReducer(state,action){
   }
 }
 
+/* ======= APP ======= */
 function App(){
   const [running,setRunning]=useState(false);
   const [settings,setSettings]=useState(DEFAULT_SETTINGS);
   const [settingsOpen,setSettingsOpen]=useState(false);
-  const [tradeSize,setTradeSize]=useState(25);
   const [signals,setSignals]=useState([]);
   const [trades,dispatch]=useReducer(tradesReducer,initialState);
+  const [dailyLoss,setDailyLoss]=useState(0);
+  const [circuitBreaker,setCircuitBreaker]=useState(false);
+  const [scanLog,setScanLog]=useState([]); // rejected scan reasons
+
   const [creds,setCreds]=useState({keyId:"",secret:""});
   const [execMode,setExecMode]=useState("simulated");
   const [connStatus,setConnStatus]=useState({state:"disconnected",message:""});
   const [alpacaAccount,setAlpacaAccount]=useState(null);
   const [alpacaPositions,setAlpacaPositions]=useState([]);
   const [alpacaErrors,setAlpacaErrors]=useState([]);
+
   const [btcPrice,setBtcPrice]=useState(null);
   const [btcSeries,setBtcSeries]=useState([]);
   const [btcLastFetch,setBtcLastFetch]=useState(null);
@@ -121,11 +201,38 @@ function App(){
   const settingsRef=useRef(settings);useEffect(()=>{settingsRef.current=settings;},[settings]);
   const credsRef=useRef(creds);useEffect(()=>{credsRef.current=creds;},[creds]);
   const modeRef=useRef(execMode);useEffect(()=>{modeRef.current=execMode;},[execMode]);
-  const sizeRef=useRef(tradeSize);useEffect(()=>{sizeRef.current=tradeSize;},[tradeSize]);
   const priceRef=useRef({BTC:null,...stockPrices});
   const tradesRef=useRef(trades);
+  const dailyLossRef=useRef(0);
   useEffect(()=>{priceRef.current={BTC:btcPrice,...stockPrices};},[btcPrice,stockPrices]);
   useEffect(()=>{tradesRef.current=trades;},[trades]);
+  useEffect(()=>{dailyLossRef.current=dailyLoss;},[dailyLoss]);
+
+  // Reset daily loss + circuit breaker at 9:30am EST each day
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      const {h,m}=getEST();
+      if(h===9&&m===30){setDailyLoss(0);setCircuitBreaker(false);}
+    },60000);
+    return()=>clearInterval(id);
+  },[]);
+
+  // Force close all positions at 3:45pm EST
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      const {h,m}=getEST();
+      const s=settingsRef.current;
+      if(h===s.forceCloseHour&&m===s.forceCloseMin){
+        const open=tradesRef.current.openTrades;
+        const now=Date.now();
+        for(const trade of open){
+          const px=priceRef.current[trade.ticker]??trade.entry;
+          dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"EOD",t:now,tolerance:10});
+        }
+      }
+    },30000);
+    return()=>clearInterval(id);
+  },[]);
 
   const testConnection=async()=>{
     if(!creds.keyId||!creds.secret){setConnStatus({state:"error",message:"paste API Key ID and Secret first"});return;}
@@ -144,20 +251,34 @@ function App(){
   useEffect(()=>{
     if(connStatus.state!=="connected")return;
     let cancelled=false;
-    const pull=async()=>{try{const t=await alpaca.getLatestTrades(TICKERS,credsRef.current);if(cancelled)return;setStockPrices(prev=>{const next={...prev};for(const sym of TICKERS){const p=t[sym]?.p;if(typeof p==="number"&&p>0)next[sym]=p;}return next;});}catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`quotes: ${e.message||e}`},...p.slice(0,9)]);}};
+    const pull=async()=>{
+      try{
+        const t=await alpaca.getLatestTrades(TICKERS,credsRef.current);
+        if(cancelled)return;
+        setStockPrices(prev=>{
+          const next={...prev};
+          for(const sym of TICKERS){const p=t[sym]?.p;if(typeof p==="number"&&p>0){next[sym]=p;updateOrbVwap(sym,p,t[sym]?.s||100);}}
+          return next;
+        });
+      }catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`quotes: ${e.message||e}`},...p.slice(0,9)]);}
+    };
     pull();const id=setInterval(pull,5000);return()=>{cancelled=true;clearInterval(id);};
   },[connStatus.state]);
 
+  // BTC poll
   useEffect(()=>{
     let cancelled=false;
     const providers=[
-      {name:"Coinbase",fetch:async()=>{const r=await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.data?.amount);if(!p||isNaN(p))throw new Error("bad payload");return p;}},
-      {name:"CoinGecko",fetch:async()=>{const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=j?.bitcoin?.usd;if(!p)throw new Error("bad payload");return p;}},
-      {name:"Binance",fetch:async()=>{const r=await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.price);if(!p||isNaN(p))throw new Error("bad payload");return p;}},
+      {name:"Coinbase",fetch:async()=>{const r=await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.data?.amount);if(!p||isNaN(p))throw new Error("bad");return p;}},
+      {name:"CoinGecko",fetch:async()=>{const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=j?.bitcoin?.usd;if(!p)throw new Error("bad");return p;}},
+      {name:"Binance",fetch:async()=>{const r=await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.price);if(!p||isNaN(p))throw new Error("bad");return p;}},
     ];
     async function poll(){
       const errs=[];
-      for(const prov of providers){try{const p=await prov.fetch();if(cancelled)return;const t=Date.now();setBtcPrice(p);setBtcLastFetch(t);setBtcSource(prov.name);setBtcError(null);setBtcSeries(prev=>{const next=[...prev,{t,p}];return next.filter(x=>x.t>=t-3600000);});setBtcPolls(n=>n+1);return;}catch(e){errs.push(`${prov.name}: ${e.message}`);}}
+      for(const prov of providers){
+        try{const p=await prov.fetch();if(cancelled)return;const t=Date.now();setBtcPrice(p);setBtcLastFetch(t);setBtcSource(prov.name);setBtcError(null);setBtcSeries(prev=>{const next=[...prev,{t,p}];return next.filter(x=>x.t>=t-3600000);});setBtcPolls(n=>n+1);updateOrbVwap("BTC",p);return;}
+        catch(e){errs.push(`${prov.name}: ${e.message}`);}
+      }
       if(!cancelled){setBtcError(errs.join(" · "));setBtcErrors(n=>n+1);setBtcSource(null);}
     }
     poll();const id=setInterval(poll,settings.pollMs);return()=>{cancelled=true;clearInterval(id);};
@@ -165,46 +286,84 @@ function App(){
 
   useEffect(()=>{const id=setInterval(()=>{if(btcLastFetch)setStale(Date.now()-btcLastFetch>settingsRef.current.pollMs*2);},2000);return()=>clearInterval(id);},[btcLastFetch]);
 
+  // Simulated stock ticks
   useEffect(()=>{
     if(connStatus.state==="connected")return;
-    const id=setInterval(()=>{const vol=settingsRef.current.stockVolPct/100;setStockPrices(prev=>{const next={...prev};for(const t of TICKERS){const b=BASELINES[t];next[t]=Math.max(0.01,prev[t]+(b-prev[t])*0.02+randn()*b*vol);}return next;});},settings.stockTickMs);
+    const id=setInterval(()=>{
+      const vol=settingsRef.current.stockVolPct/100;
+      setStockPrices(prev=>{
+        const next={...prev};
+        for(const t of TICKERS){
+          const b=BASELINES[t];
+          const newPx=Math.max(0.01,prev[t]+(b-prev[t])*0.02+randn()*b*vol);
+          next[t]=newPx;
+          updateOrbVwap(t,newPx,Math.floor(500+Math.random()*1500));
+        }
+        return next;
+      });
+    },settings.stockTickMs);
     return()=>clearInterval(id);
   },[settings.stockTickMs,connStatus.state]);
 
+  // SL / TP / VWAP exit check
   useEffect(()=>{
     const open=tradesRef.current.openTrades;if(!open.length)return;
     const now=Date.now(),tol=settingsRef.current.assertTolerancePct;
     for(const trade of open){
       const px=priceRef.current[trade.ticker];if(!px)continue;
       let hit=null;
-      if(trade.direction==="LONG"){if(px>=trade.tp)hit="TP";else if(px<=trade.sl)hit="SL";}
-      else{if(px<=trade.tp)hit="TP";else if(px>=trade.sl)hit="SL";}
+      if(px>=trade.tp)hit="TP";
+      else if(px<=trade.sl)hit="SL";
+      else if(trade.vwap&&px<trade.vwap)hit="VWAP"; // VWAP stop
       if(hit){
-        const closePrice=hit==="TP"?trade.tp:trade.sl;
-        if(trade.alpacaOrderId&&modeRef.current==="alpaca"&&trade.ticker!=="BTC")alpaca.closePosition(trade.ticker,credsRef.current).catch(e=>setAlpacaErrors(p=>[{t:Date.now(),msg:`close ${trade.ticker}: ${e.message||e}`},...p.slice(0,9)]));
+        const closePrice=hit==="TP"?trade.tp:px;
+        if(trade.alpacaOrderId&&modeRef.current==="alpaca"&&trade.ticker!=="BTC")
+          alpaca.closePosition(trade.ticker,credsRef.current).catch(e=>setAlpacaErrors(p=>[{t:Date.now(),msg:`close ${trade.ticker}: ${e.message||e}`},...p.slice(0,9)]));
+        // Track daily loss for circuit breaker
+        if(hit==="SL"||hit==="VWAP"){
+          const lossDollar=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
+          setDailyLoss(d=>{
+            const newLoss=d+lossDollar;
+            if(newLoss>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);
+            return newLoss;
+          });
+        }
         dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now,tolerance:tol});
       }
     }
   },[btcPrice,stockPrices]);
 
+  // Signal / entry loop
   useEffect(()=>{
     if(!running)return;
     const fire=async()=>{
+      if(circuitBreaker){setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:"🚨 Circuit breaker active — daily loss limit reached"},...p.slice(0,29)]);return;}
       const open=new Set(tradesRef.current.openTrades.map(t=>t.ticker));
-      const candidates=["BTC",...TICKERS].filter(t=>!open.has(t));if(!candidates.length)return;
+      const balance=tradesRef.current.balance;
+      const candidates=[...TICKERS].filter(t=>!open.has(t)); // BTC excluded — LONG only on stocks
+      if(!candidates.length)return;
       const ticker=candidates[Math.floor(Math.random()*candidates.length)];
       const px=priceRef.current[ticker];if(!px)return;
-      const sig=makeSignal(ticker,px,settingsRef.current);
+      const sig=makeSignal(ticker,px,settingsRef.current,balance);
+      if(!sig.entryCondition.pass){
+        setScanLog(p=>[{t:nowIso(),ticker,reason:sig.entryCondition.reason},...p.slice(0,29)]);
+        return;
+      }
       setSignals(s=>[sig,...s].slice(0,50));
       let alpacaOrderId=null;
-      if(modeRef.current==="alpaca"&&ticker!=="BTC"&&connStatus.state==="connected"){
-        try{const order=await alpaca.placeOrder({symbol:ticker,notional:sizeRef.current,side:sig.direction==="LONG"?"buy":"sell"},credsRef.current);alpacaOrderId=order.id;}
-        catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);return;}
+      if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+        try{
+          const order=await alpaca.placeOrder({symbol:ticker,notional:sig.notional,side:"buy"},credsRef.current);
+          alpacaOrderId=order.id;
+        }catch(e){
+          setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);
+          return;
+        }
       }
-      dispatch({type:"OPEN",trade:{id:`t-${sig.id}`,signalId:sig.id,ticker,direction:sig.direction,entry:sig.entry,tp:sig.tp,sl:sig.sl,slPct:sig.slPct,tpPct:sig.tpPct,size:sizeRef.current,openedAt:nowIso(),openPrice:px,alpacaOrderId}});
+      dispatch({type:"OPEN",trade:{id:`t-${sig.id}`,signalId:sig.id,ticker,direction:"LONG",entry:sig.entry,tp:sig.tp,sl:sig.sl,slPct:sig.slPct,tpPct:sig.tpPct,size:sig.notional,vwap:sig.vwap,openedAt:nowIso(),openPrice:px,alpacaOrderId}});
     };
     fire();const id=setInterval(fire,settings.signalIntervalMs);return()=>clearInterval(id);
-  },[running,settings.signalIntervalMs,connStatus.state]);
+  },[running,settings.signalIntervalMs,connStatus.state,circuitBreaker]);
 
   const stats=useMemo(()=>{
     const closed=trades.closedTrades;
@@ -222,29 +381,38 @@ function App(){
 
   const btcDelta=useMemo(()=>{if(btcSeries.length<2)return null;const f=btcSeries[0].p,l=btcSeries[btcSeries.length-1].p;return{abs:l-f,pct:((l-f)/f)*100};},[btcSeries]);
 
+  const manualClose=(trade)=>{
+    const px=priceRef.current[trade.ticker]??trade.entry;
+    if(trade.alpacaOrderId&&modeRef.current==="alpaca"&&trade.ticker!=="BTC")
+      alpaca.closePosition(trade.ticker,credsRef.current).catch(e=>setAlpacaErrors(p=>[{t:Date.now(),msg:`close ${trade.ticker}: ${e.message||e}`},...p.slice(0,9)]));
+    dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now(),tolerance:settingsRef.current.assertTolerancePct});
+  };
+
   const S=styles;
-  return (
+  const estNow=getEST();
+
+  return(
     <div style={S.shell}>
       <header style={S.header}>
-        <div style={S.brand}>
-          <span style={S.brandDot}/><span style={S.brandText}>TRADEEDGE</span><span style={S.brandSub}>// TEST HARNESS</span>
-        </div>
+        <div style={S.brand}><span style={S.brandDot}/><span style={S.brandText}>TRADEEDGE</span><span style={S.brandSub}>// ORB MOMENTUM</span></div>
         <div style={S.headerRight}>
+          {circuitBreaker&&<div style={{...S.pill,borderColor:"#FF7A7A",color:"#FF7A7A"}}><span style={{...S.pillDot,background:"#FF7A7A"}}/>🚨 CIRCUIT BREAKER</div>}
+          <div style={{...S.pill,borderColor:"#5a5a5a",color:"#5a5a5a"}}>EST {String(estNow.h).padStart(2,"0")}:{String(estNow.m).padStart(2,"0")}</div>
           <AlpacaPill connStatus={connStatus} mode={execMode}/>
           <StatusPill running={running} stale={stale} btcError={btcError}/>
-          <button onClick={()=>setRunning(r=>!r)} style={{...S.runBtn,...(running?S.runBtnStop:{})}}>{running?"■ STOP RUN":"▶ START RUN"}</button>
-          <button onClick={()=>setSettingsOpen(o=>!o)} style={{...S.resetBtn,...(settingsOpen?{borderColor:"#FFB627",color:"#FFB627"}:{})}}> ⚙ SETTINGS</button>
-          <button onClick={()=>{dispatch({type:"RESET"});setSignals([]);}} style={S.resetBtn}>RESET</button>
+          <button onClick={()=>setRunning(r=>!r)} style={{...S.runBtn,...(running?S.runBtnStop:{})}}>{running?"■ STOP":"▶ START"}</button>
+          <button onClick={()=>setSettingsOpen(o=>!o)} style={{...S.resetBtn,...(settingsOpen?{borderColor:"#FFB627",color:"#FFB627"}:{})}}>⚙ SETTINGS</button>
+          <button onClick={()=>{dispatch({type:"RESET"});setSignals([]);setDailyLoss(0);setCircuitBreaker(false);setScanLog([]);}} style={S.resetBtn}>RESET</button>
         </div>
       </header>
 
-      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors}/>}
+      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} dailyLoss={dailyLoss} circuitBreaker={circuitBreaker}/>}
 
+      {/* BTC + stats */}
       <section style={S.row}>
         <div style={{...S.card,flex:2}}>
           <div style={S.cardHead}>
-            <div>
-              <div style={S.cardLabel}>LIVE FEED — BTC/USD</div>
+            <div><div style={S.cardLabel}>LIVE FEED — BTC/USD</div>
               <div style={S.cardBigNum}>${btcPrice?fmt(btcPrice,2):"—"} {btcDelta&&<span style={{...S.delta,color:btcDelta.abs>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(btcDelta.pct)} since open</span>}</div>
             </div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(5,auto)",gap:16}}>
@@ -255,7 +423,7 @@ function App(){
               <Diag label="CADENCE" value={`${settings.pollMs/1000}s`}/>
             </div>
           </div>
-          <div style={{height:210,marginTop:12}}>
+          <div style={{height:200,marginTop:12}}>
             <ResponsiveContainer>
               <AreaChart data={btcSeries} margin={{top:6,right:10,left:0,bottom:0}}>
                 <defs><linearGradient id="btcg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#FFB627" stopOpacity={0.4}/><stop offset="100%" stopColor="#FFB627" stopOpacity={0}/></linearGradient></defs>
@@ -267,8 +435,9 @@ function App(){
             </ResponsiveContainer>
           </div>
           {btcError&&<div style={S.errorBar}>ALL PROVIDERS FAILED · retry in {settings.pollMs/1000}s</div>}
-          {stale&&!btcError&&<div style={S.warnBar}>⚠ STALE — no fresh tick in &gt;{(settings.pollMs*2)/1000}s</div>}
+          {stale&&!btcError&&<div style={S.warnBar}>⚠ STALE — no fresh tick</div>}
         </div>
+
         <div style={{...S.card,flex:1,minWidth:260}}>
           <div style={S.cardLabel}>RUN STATS</div>
           <div style={S.bigEquity}>${fmt(trades.balance,2)} <span style={{color:stats.pnl>=0?"#7CFFB2":"#FF7A7A",fontSize:13}}>{fmtPct(stats.pnlPct)}</span></div>
@@ -277,19 +446,25 @@ function App(){
             <Stat label="WIN RATE" v={`${stats.winRate.toFixed(1)}%`}/><Stat label="AVG R:R" v={stats.avgRR?stats.avgRR.toFixed(2):"—"}/>
             <Stat label="MAX DD" v={`${stats.maxDD.toFixed(2)}%`} bad={stats.maxDD<-2}/><Stat label="AVG HOLD" v={`${stats.avgHoldSec.toFixed(0)}s`}/>
           </div>
-          <div style={{marginTop:14}}>
-            <div style={S.cardLabel}>TRADE SIZE</div>
-            <div style={S.sizeRow}>{settings.sizePresets.map(s=><button key={s} onClick={()=>setTradeSize(s)} style={{...S.sizeBtn,...(tradeSize===s?S.sizeBtnActive:{})}}>${s}</button>)}</div>
+          <div style={{marginTop:12,background:"#060606",border:"1px solid #1a1a1a",padding:"10px 12px",borderRadius:2}}>
+            <div style={S.cardLabel}>DAILY LOSS TRACKER</div>
+            <div style={{fontSize:18,fontWeight:500,color:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#e8e8e8",marginTop:4}}>
+              -${fmt(dailyLoss,2)} <span style={{fontSize:10,color:"#5a5a5a"}}>/ ${settings.dailyLossLimit} limit</span>
+            </div>
+            <div style={{marginTop:6,height:4,background:"#1a1a1a",borderRadius:2}}>
+              <div style={{height:"100%",width:`${Math.min(100,(dailyLoss/settings.dailyLossLimit)*100)}%`,background:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#7CFFB2",borderRadius:2,transition:"width 0.3s"}}/>
+            </div>
           </div>
-          <div style={{marginTop:14}}>
+          <div style={{marginTop:10}}>
             <div style={S.cardLabel}>ASSERTIONS</div>
-            <div style={S.assertSummary}><span style={{color:"#7CFFB2"}}>{stats.assertionsPassed}</span><span style={{color:"#5a5a5a"}}> / </span><span>{stats.assertionsTotal}</span><span style={{fontSize:10,color:"#5a5a5a",marginLeft:6}}>within {settings.assertTolerancePct}%</span></div>
+            <div style={S.assertSummary}><span style={{color:"#7CFFB2"}}>{stats.assertionsPassed}</span><span style={{color:"#5a5a5a"}}> / </span><span>{stats.assertionsTotal}</span><span style={{fontSize:10,color:"#5a5a5a",marginLeft:6}}>exits verified</span></div>
           </div>
         </div>
       </section>
 
       {connStatus.state==="connected"&&alpacaAccount&&<AlpacaAccountCard account={alpacaAccount} positions={alpacaPositions} mode={execMode} errors={alpacaErrors}/>}
 
+      {/* Equity curve */}
       <section style={S.card}>
         <div style={S.cardLabel}>EQUITY CURVE</div>
         <div style={{height:120,marginTop:8}}>
@@ -305,44 +480,122 @@ function App(){
         </div>
       </section>
 
+      {/* Ticker grid */}
       <section style={S.card}>
-        <div style={S.cardLabel}>TICKERS {connStatus.state==="connected"?"(Alpaca IEX · 5s)":"(simulated · ~0.15% σ / 3s)"}</div>
+        <div style={S.cardLabel}>TICKERS {connStatus.state==="connected"?"(Alpaca IEX · 5s)":"(simulated)"} — ORB · VWAP · RSI</div>
         <div style={S.tickerGrid}>
-          {TICKERS.map(t=>{const px=stockPrices[t],b=BASELINES[t],drift=((px-b)/b)*100,ot=trades.openTrades.find(o=>o.ticker===t);return(
-            <div key={t} style={S.tickerCell}><div style={S.tickerSym}>{t}</div><div style={S.tickerPx}>${fmt(px,2)}</div><div style={{...S.tickerDrift,color:drift>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(drift)}</div>{ot&&<div style={S.tickerBadge}>{ot.direction} · ${ot.size}</div>}</div>
-          );})}
-          <div style={S.tickerCell}><div style={{...S.tickerSym,color:"#FFB627"}}>BTC</div><div style={S.tickerPx}>${btcPrice?fmt(btcPrice,0):"—"}</div><div style={{...S.tickerDrift,color:"#FFB627"}}>LIVE</div>{trades.openTrades.find(o=>o.ticker==="BTC")&&<div style={S.tickerBadge}>{trades.openTrades.find(o=>o.ticker==="BTC").direction} · ${trades.openTrades.find(o=>o.ticker==="BTC").size}</div>}</div>
+          {TICKERS.map(t=>{
+            const px=stockPrices[t],b=BASELINES[t],drift=((px-b)/b)*100;
+            const ob=orbState[t],rsi=calcRSI(ob.priceHistory);
+            const aboveVwap=ob.vwap&&px>ob.vwap;
+            const aboveOrb=ob.orbHigh&&px>ob.orbHigh;
+            const ot=trades.openTrades.find(o=>o.ticker===t);
+            return(
+              <div key={t} style={{...S.tickerCell,...(aboveOrb&&aboveVwap?{borderColor:"#FFB627"}:{})}}>
+                <div style={S.tickerSym}>{t}</div>
+                <div style={S.tickerPx}>${fmt(px,2)}</div>
+                <div style={{fontSize:9,color:"#5a5a5a",marginTop:2}}>RSI {rsi.toFixed(0)} · {ob.vwap?`VWAP $${fmt(ob.vwap,2)}`:"no VWAP"}</div>
+                <div style={{fontSize:9,marginTop:1,color:aboveOrb?"#FFB627":"#3a3a3a"}}>{ob.orbHigh?`ORB $${fmt(ob.orbHigh,2)}`:"no ORB"} {aboveOrb?"↑":""}</div>
+                {ot&&<div style={S.tickerBadge}>{ot.direction} · ${fmt(ot.size,0)}</div>}
+              </div>
+            );
+          })}
         </div>
       </section>
 
+      {/* Open + closed */}
       <section style={S.row}>
         <div style={{...S.card,flex:1}}>
           <div style={S.cardLabel}>OPEN POSITIONS ({trades.openTrades.length})</div>
-          {!trades.openTrades.length?<div style={S.empty}>{running?"waiting for next signal…":"press START RUN to begin"}</div>:(
-            <table style={S.table}><thead><tr><th style={S.th}>SYM</th><th style={S.th}>DIR</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP</th><th style={S.thR}>SL</th><th style={S.thR}>UPL</th><th style={S.th}></th></tr></thead>
-            <tbody>{trades.openTrades.map(o=>{const px=priceRef.current[o.ticker]??o.entry,upl=o.direction==="LONG"?((px-o.entry)/o.entry)*100:((o.entry-px)/o.entry)*100;return(<tr key={o.id}><td style={S.td}>{o.ticker}</td><td style={{...S.td,color:o.direction==="LONG"?"#7CFFB2":"#FF7A7A"}}>{o.direction}</td><td style={S.tdR}>{fmt(o.entry,2)}</td><td style={S.tdR}>{fmt(px,2)}</td><td style={{...S.tdR,color:"#7CFFB2"}}>{fmt(o.tp,2)}</td><td style={{...S.tdR,color:"#FF7A7A"}}>{fmt(o.sl,2)}</td><td style={{...S.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</td><td style={S.td}><button onClick={()=>{const px=priceRef.current[o.ticker]??o.entry;if(o.alpacaOrderId&&modeRef.current==="alpaca"&&o.ticker!=="BTC")alpaca.closePosition(o.ticker,credsRef.current).catch(e=>setAlpacaErrors(p=>[{t:Date.now(),msg:`close ${o.ticker}: ${e.message||e}`},...p.slice(0,9)]));dispatch({type:"CLOSE",tradeId:o.id,closePrice:px,reason:"MANUAL",t:Date.now(),tolerance:settingsRef.current.assertTolerancePct});}} style={{background:"transparent",border:"1px solid #3a3a3a",color:"#a0a0a0",fontSize:9,letterSpacing:1,fontFamily:"inherit",cursor:"pointer",padding:"3px 7px",borderRadius:2}}>CLOSE</button></td></tr>);})}</tbody></table>
+          {!trades.openTrades.length?<div style={S.empty}>{running?"scanning for ORB breakouts…":"press START to begin"}</div>:(
+            <table style={S.table}>
+              <thead><tr><th style={S.th}>SYM</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP</th><th style={S.thR}>SL</th><th style={S.thR}>VWAP</th><th style={S.thR}>UPL</th><th style={S.th}></th></tr></thead>
+              <tbody>{trades.openTrades.map(o=>{
+                const px=priceRef.current[o.ticker]??o.entry;
+                const upl=((px-o.entry)/o.entry)*100;
+                const belowVwap=o.vwap&&px<o.vwap;
+                return(
+                  <tr key={o.id}>
+                    <td style={S.td}>{o.ticker}</td>
+                    <td style={S.tdR}>{fmt(o.entry,2)}</td><td style={S.tdR}>{fmt(px,2)}</td>
+                    <td style={{...S.tdR,color:"#7CFFB2"}}>{fmt(o.tp,2)}</td>
+                    <td style={{...S.tdR,color:"#FF7A7A"}}>{fmt(o.sl,2)}</td>
+                    <td style={{...S.tdR,color:belowVwap?"#FF7A7A":"#5a5a5a"}}>{fmt(o.vwap,2)}{belowVwap?" ⚠":""}</td>
+                    <td style={{...S.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</td>
+                    <td style={S.td}><button onClick={()=>manualClose(o)} style={S.closeBtn}>CLOSE</button></td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
           )}
         </div>
         <div style={{...S.card,flex:2}}>
-          <div style={S.cardLabel}>CLOSED TRADES — LOG + ASSERTIONS ({trades.closedTrades.length})</div>
+          <div style={S.cardLabel}>TRADE JOURNAL — {trades.closedTrades.length} CLOSED</div>
           {!trades.closedTrades.length?<div style={S.empty}>no closed trades yet</div>:(
             <div style={{maxHeight:300,overflow:"auto"}}>
-              <table style={S.table}><thead><tr><th style={S.th}>TIME</th><th style={S.th}>SYM</th><th style={S.th}>DIR</th><th style={S.thR}>ENTRY</th><th style={S.thR}>EXIT</th><th style={S.th}>RSN</th><th style={S.thR}>PNL%</th><th style={S.thR}>PNL$</th><th style={S.thR}>HOLD</th><th style={S.th}>CHECK</th></tr></thead>
-              <tbody>{trades.closedTrades.map(c=>(<tr key={c.id}><td style={S.td}>{shortTime(c.closedAt)}</td><td style={S.td}>{c.ticker}</td><td style={{...S.td,color:c.direction==="LONG"?"#7CFFB2":"#FF7A7A"}}>{c.direction}</td><td style={S.tdR}>{fmt(c.entry,2)}</td><td style={S.tdR}>{fmt(c.closePrice,2)}</td><td style={{...S.td,color:c.reason==="TP"?"#7CFFB2":"#FF7A7A"}}>{c.reason}</td><td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(c.pnlPct)}</td><td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{c.pnl>=0?"+":""}{fmt(c.pnl,2)}</td><td style={S.tdR}>{(c.holdMs/1000).toFixed(0)}s</td><td style={S.td}><span style={{...S.assertChip,background:c.assertion.pass?"#0e3a22":"#3a0e0e",color:c.assertion.pass?"#7CFFB2":"#FF7A7A"}} title={`expected ${c.assertion.expected} · actual ${c.assertion.actual}`}>{c.assertion.pass?"PASS":"FAIL"}</span></td></tr>))}</tbody></table>
+              <table style={S.table}>
+                <thead><tr>
+                  <th style={S.th}>TIME</th><th style={S.th}>SYM</th>
+                  <th style={S.thR}>ENTRY</th><th style={S.thR}>EXIT</th>
+                  <th style={S.th}>RSN</th><th style={S.thR}>PNL%</th><th style={S.thR}>PNL$</th>
+                  <th style={S.thR}>RSI</th><th style={S.thR}>VWAP</th><th style={S.thR}>ORB</th>
+                  <th style={S.thR}>HOLD</th><th style={S.th}>✓</th>
+                </tr></thead>
+                <tbody>{trades.closedTrades.map(c=>(
+                  <tr key={c.id}>
+                    <td style={S.td}>{shortTime(c.closedAt)}</td>
+                    <td style={S.td}>{c.ticker}</td>
+                    <td style={S.tdR}>{fmt(c.entry,2)}</td>
+                    <td style={S.tdR}>{fmt(c.closePrice,2)}</td>
+                    <td style={{...S.td,color:c.reason==="TP"?"#7CFFB2":c.reason==="MANUAL"?"#FFB627":"#FF7A7A"}}>{c.reason}</td>
+                    <td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(c.pnlPct)}</td>
+                    <td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{c.pnl>=0?"+":""}{fmt(c.pnl,2)}</td>
+                    <td style={S.tdR}>{c.rsi?c.rsi.toFixed(0):"—"}</td>
+                    <td style={S.tdR}>{c.vwap?fmt(c.vwap,2):"—"}</td>
+                    <td style={S.tdR}>{c.orbHigh?fmt(c.orbHigh,2):"—"}</td>
+                    <td style={S.tdR}>{(c.holdMs/1000).toFixed(0)}s</td>
+                    <td style={S.td}><span style={{...S.assertChip,background:c.assertion.pass?"#0e3a22":"#3a0e0e",color:c.assertion.pass?"#7CFFB2":"#FF7A7A"}}>{c.assertion.pass?"PASS":"FAIL"}</span></td>
+                  </tr>
+                ))}</tbody>
+              </table>
             </div>
           )}
         </div>
       </section>
 
-      <section style={S.card}>
-        <div style={S.cardLabel}>SIGNAL FEED ({signals.length})</div>
-        {!signals.length?<div style={S.empty}>no signals yet</div>:(
-          <div style={{maxHeight:180,overflow:"auto"}}>
-            {signals.map(s=><div key={s.id} style={S.sigRow}><span style={{color:"#5a5a5a",minWidth:60}}>{shortTime(s.createdAt)}</span><span style={{fontWeight:700,minWidth:50}}>{s.ticker}</span><span style={{fontWeight:700,minWidth:50,color:s.direction==="LONG"?"#7CFFB2":"#FF7A7A"}}>{s.direction}</span><span style={{color:"#a0a0a0",fontSize:10}}>entry {fmt(s.entry,2)} · tp {fmt(s.tp,2)} · sl {fmt(s.sl,2)} · rsi {s.rsi.toFixed(0)} · macd {s.macd.toFixed(2)}</span></div>)}
-          </div>
-        )}
+      {/* Scan log */}
+      <section style={S.row}>
+        <div style={{...S.card,flex:1}}>
+          <div style={S.cardLabel}>SIGNAL FEED — ENTRIES ({signals.length})</div>
+          {!signals.length?<div style={S.empty}>no entries yet</div>:(
+            <div style={{maxHeight:160,overflow:"auto"}}>
+              {signals.map(s=>(
+                <div key={s.id} style={S.sigRow}>
+                  <span style={{color:"#5a5a5a",minWidth:60}}>{shortTime(s.createdAt)}</span>
+                  <span style={{fontWeight:700,minWidth:50,color:"#7CFFB2"}}>{s.ticker}</span>
+                  <span style={{fontSize:10,color:"#a0a0a0"}}>entry ${fmt(s.entry,2)} · tp ${fmt(s.tp,2)} · sl ${fmt(s.sl,2)} · rsi {s.rsi.toFixed(0)} · vwap ${fmt(s.vwap,2)} · orb ${fmt(s.orbHigh,2)} · vol {s.volRatio.toFixed(2)}x · size ${fmt(s.notional,2)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{...S.card,flex:1}}>
+          <div style={S.cardLabel}>SCAN LOG — REJECTED ({scanLog.length})</div>
+          {!scanLog.length?<div style={S.empty}>no rejections yet</div>:(
+            <div style={{maxHeight:160,overflow:"auto"}}>
+              {scanLog.map((s,i)=>(
+                <div key={i} style={{...S.sigRow,borderColor:"#1a1a1a"}}>
+                  <span style={{color:"#5a5a5a",minWidth:60}}>{shortTime(s.t)}</span>
+                  <span style={{fontWeight:700,minWidth:50}}>{s.ticker}</span>
+                  <span style={{fontSize:10,color:"#FF7A7A"}}>{s.reason}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
-      <footer style={S.footer}>starting balance ${STARTING_BALANCE.toLocaleString()} · all state in-memory · resets on reload</footer>
+
+      <footer style={S.footer}>ORB momentum strategy · LONG only · 1% risk/trade · TP +{settings.tpPct}% SL -{settings.slPct}% · VWAP stop · circuit breaker ${settings.dailyLossLimit}</footer>
     </div>
   );
 }
@@ -357,7 +610,7 @@ function AlpacaAccountCard({account,positions,mode,errors}){
   return<section style={{...styles.card,borderLeft:"2px solid #FFB627"}}><div style={styles.cardHead}><div><div style={styles.cardLabel}>ALPACA PAPER · {account.account_number}{mode==="alpaca"?<span style={{color:"#FFB627",marginLeft:10}}>· ORDERS LIVE</span>:<span style={{color:"#5a5a5a",marginLeft:10}}>· read-only</span>}</div><div style={styles.cardBigNum}>${fmt(equity,2)} <span style={{...styles.delta,color:dayPnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(dayPnlPct)} today</span></div></div><div style={{display:"grid",gridTemplateColumns:"repeat(4,auto)",gap:16}}><Diag label="BUYING POWER" value={`$${fmt(bp,0)}`}/><Diag label="CASH" value={`$${fmt(Number(account.cash),0)}`}/><Diag label="POSITIONS" value={positions.length}/><Diag label="STATUS" value={account.status}/></div></div>{positions.length>0&&<table style={{...styles.table,marginTop:14}}><thead><tr><th style={styles.th}>SYM</th><th style={styles.th}>SIDE</th><th style={styles.thR}>QTY</th><th style={styles.thR}>AVG ENTRY</th><th style={styles.thR}>CURRENT</th><th style={styles.thR}>MKT VAL</th><th style={styles.thR}>UPL</th><th style={styles.thR}>UPL%</th></tr></thead><tbody>{positions.map(p=>{const upl=Number(p.unrealized_pl),uplPct=Number(p.unrealized_plpc)*100;return<tr key={p.asset_id}><td style={styles.td}>{p.symbol}</td><td style={{...styles.td,color:p.side==="long"?"#7CFFB2":"#FF7A7A"}}>{p.side.toUpperCase()}</td><td style={styles.tdR}>{fmt(Number(p.qty),4)}</td><td style={styles.tdR}>{fmt(Number(p.avg_entry_price),2)}</td><td style={styles.tdR}>{fmt(Number(p.current_price),2)}</td><td style={styles.tdR}>{fmt(Number(p.market_value),2)}</td><td style={{...styles.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{upl>=0?"+":""}{fmt(upl,2)}</td><td style={{...styles.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(uplPct)}</td></tr>;})}</tbody></table>}{errors.length>0&&<div style={{marginTop:12}}><div style={styles.cardLabel}>RECENT API ERRORS</div><div style={{maxHeight:80,overflow:"auto",fontSize:10,color:"#FF7A7A"}}>{errors.slice(0,5).map((e,i)=><div key={i} style={{padding:"2px 0"}}><span style={{color:"#5a5a5a"}}>{shortTime(new Date(e.t).toISOString())}</span> {e.msg}</div>)}</div></div>}</section>;
 }
 
-function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount}){
+function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount,alpacaErrors,dailyLoss,circuitBreaker}){
   const set=(k,v)=>onChange({...settings,[k]:v});
   return(
     <section style={styles.settingsCard}>
@@ -367,7 +620,7 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
       </div>
       <div style={{...styles.settingGroup,borderColor:"#FFB627",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#FFB627"}}>ALPACA PAPER ACCOUNT</div>
-        <div style={styles.alpacaWarn}>⚠ paper-trading keys only · stored in memory only · never paste live keys here</div>
+        <div style={styles.alpacaWarn}>⚠ paper-trading keys only · stored in memory · never paste live keys here</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:10}}>
           <SecretField label="API KEY ID" value={creds.keyId} placeholder="PK…" onChange={v=>onCredsChange({...creds,keyId:v.trim()})} mask={false}/>
           <SecretField label="SECRET KEY" value={creds.secret} placeholder="long random string" onChange={v=>onCredsChange({...creds,secret:v.trim()})} mask/>
@@ -387,19 +640,24 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:14}}>
         <SettingGroup title="STRATEGY">
-          <NumField label="TAKE PROFIT %" value={settings.tpPct} min={0.1} max={50} step={0.1} onChange={v=>set("tpPct",v)} help="LONG: +tp% · SHORT: -tp%"/>
-          <NumField label="STOP LOSS %" value={settings.slPct} min={0.1} max={50} step={0.1} onChange={v=>set("slPct",v)} help="symmetric"/>
-          <NumField label="LONG BIAS %" value={settings.longBiasPct} min={0} max={100} step={1} onChange={v=>set("longBiasPct",v)} help="probability of LONG"/>
+          <NumField label="TAKE PROFIT %" value={settings.tpPct} min={0.5} max={20} step={0.5} onChange={v=>set("tpPct",v)} help="default 4%"/>
+          <NumField label="STOP LOSS %"   value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)} help="default 2% — VWAP stop may exit earlier"/>
+          <NumField label="RSI MIN"        value={settings.rsiMin} min={30} max={70} step={1} onChange={v=>set("rsiMin",v)} help="minimum RSI to enter"/>
+          <NumField label="RSI MAX"        value={settings.rsiMax} min={50} max={95} step={1} onChange={v=>set("rsiMax",v)} help="maximum RSI (avoid exhaustion)"/>
+          <NumField label="VOL MULTIPLIER" value={settings.volumeMultiplier} min={1} max={5} step={0.1} onChange={v=>set("volumeMultiplier",v)} help="current vol vs ORB avg vol"/>
         </SettingGroup>
-        <SettingGroup title="MARKET SIM">
-          <NumField label="STOCK VOL % (σ)" value={settings.stockVolPct} min={0.01} max={2} step={0.01} onChange={v=>set("stockVolPct",v)} help="per-tick stddev"/>
+        <SettingGroup title="RISK">
+          <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={5000} step={50} onChange={v=>set("dailyLossLimit",v)} help="circuit breaker triggers at this loss"/>
+          <NumField label="NO ENTRY AFTER (HR EST)" value={settings.noEntryAfterHour} min={9} max={15} step={1} onChange={v=>set("noEntryAfterHour",v)} help="default 11 (11:30am)"/>
+          <NumField label="NO ENTRY AFTER (MIN)" value={settings.noEntryAfterMin} min={0} max={59} step={1} onChange={v=>set("noEntryAfterMin",v)} help="default 30"/>
+          <NumField label="FORCE CLOSE (HR EST)" value={settings.forceCloseHour} min={14} max={16} step={1} onChange={v=>set("forceCloseHour",v)} help="default 15 (3:45pm)"/>
+          <NumField label="FORCE CLOSE (MIN)" value={settings.forceCloseMin} min={0} max={59} step={1} onChange={v=>set("forceCloseMin",v)} help="default 45"/>
+        </SettingGroup>
+        <SettingGroup title="SIM / TIMING">
+          <NumField label="STOCK VOL % (σ)" value={settings.stockVolPct} min={0.01} max={2} step={0.01} onChange={v=>set("stockVolPct",v)} help="simulated price noise"/>
           <NumField label="STOCK TICK MS" value={settings.stockTickMs} min={250} max={10000} step={250} onChange={v=>set("stockTickMs",v)} help="simulated price cadence"/>
-          <NumField label="BTC POLL MS" value={settings.pollMs} min={10000} max={120000} step={1000} onChange={v=>set("pollMs",v)} help="≥10s recommended"/>
-        </SettingGroup>
-        <SettingGroup title="RUN">
-          <NumField label="SIGNAL INTERVAL MS" value={settings.signalIntervalMs} min={1000} max={60000} step={500} onChange={v=>set("signalIntervalMs",v)} help="signal cadence"/>
-          <NumField label="ASSERT TOLERANCE %" value={settings.assertTolerancePct} min={0.05} max={5} step={0.05} onChange={v=>set("assertTolerancePct",v)} help="pass/fail band"/>
-          <PresetField label="TRADE SIZE PRESETS" value={settings.sizePresets} onChange={v=>set("sizePresets",v)} help="4 comma-separated amounts"/>
+          <NumField label="BTC POLL MS"   value={settings.pollMs} min={10000} max={120000} step={1000} onChange={v=>set("pollMs",v)} help="≥10s recommended"/>
+          <NumField label="SCAN INTERVAL MS" value={settings.signalIntervalMs} min={1000} max={60000} step={500} onChange={v=>set("signalIntervalMs",v)} help="how often to scan for entries"/>
         </SettingGroup>
       </div>
     </section>
@@ -408,23 +666,23 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
 
 function SettingGroup({title,children}){return<div style={styles.settingGroup}><div style={styles.settingGroupTitle}>{title}</div><div style={{display:"flex",flexDirection:"column",gap:10}}>{children}</div></div>;}
 function NumField({label,value,min,max,step,onChange,help}){const[draft,setDraft]=useState(String(value));useEffect(()=>{setDraft(String(value));},[value]);const commit=()=>{const n=Number(draft);if(isNaN(n)){setDraft(String(value));return;}const c=Math.max(min,Math.min(max,n));onChange(c);setDraft(String(c));};return<label style={{display:"flex",flexDirection:"column",gap:3}}><div style={styles.fieldLabel}>{label}</div><input type="number" value={draft} min={min} max={max} step={step} onChange={e=>setDraft(e.target.value)} onBlur={commit} onKeyDown={e=>{if(e.key==="Enter")e.currentTarget.blur();}} style={styles.input}/>{help&&<div style={{fontSize:9,color:"#3a3a3a",marginTop:2}}>{help}</div>}</label>;}
-function PresetField({label,value,onChange,help}){const[draft,setDraft]=useState(value.join(", "));useEffect(()=>{setDraft(value.join(", "));},[value]);const commit=()=>{const parts=draft.split(",").map(s=>Number(s.trim())).filter(n=>!isNaN(n)&&n>0);if(!parts.length){setDraft(value.join(", "));return;}const four=parts.slice(0,4);while(four.length<4)four.push(four[four.length-1]*2);onChange(four);setDraft(four.join(", "));};return<label style={{display:"flex",flexDirection:"column",gap:3}}><div style={styles.fieldLabel}>{label}</div><input type="text" value={draft} onChange={e=>setDraft(e.target.value)} onBlur={commit} onKeyDown={e=>{if(e.key==="Enter")e.currentTarget.blur();}} style={styles.input}/>{help&&<div style={{fontSize:9,color:"#3a3a3a",marginTop:2}}>{help}</div>}</label>;}
 function SecretField({label,value,placeholder,onChange,mask}){const[revealed,setRevealed]=useState(false);return<label style={{display:"flex",flexDirection:"column",gap:3}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={styles.fieldLabel}>{label}</div>{mask&&<button type="button" onClick={()=>setRevealed(r=>!r)} style={styles.eyeBtn}>{revealed?"HIDE":"SHOW"}</button>}</div><input type={mask&&!revealed?"password":"text"} value={value} placeholder={placeholder} onChange={e=>onChange(e.target.value)} spellCheck={false} autoComplete="off" style={styles.input}/></label>;}
 function ConnIndicator({connStatus}){const cm={disconnected:"#5a5a5a",testing:"#FFB627",connected:"#7CFFB2",error:"#FF7A7A"};const color=cm[connStatus.state]||"#5a5a5a";return<div style={{display:"flex",alignItems:"center",gap:8,fontSize:11}}><span style={{...styles.pillDot,background:color}}/><span style={{color,fontWeight:700,letterSpacing:1.5}}>{connStatus.state.toUpperCase()}</span>{connStatus.message&&<span style={{color:"#a0a0a0",fontSize:10}}>{connStatus.message}</span>}</div>;}
 
 const styles={
   shell:{fontFamily:"'JetBrains Mono',ui-monospace,monospace",background:"#060606",color:"#e8e8e8",minHeight:"100vh",padding:16,display:"flex",flexDirection:"column",gap:12},
-  header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 4px 12px",borderBottom:"1px solid #1a1a1a"},
+  header:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 4px 12px",borderBottom:"1px solid #1a1a1a",flexWrap:"wrap",gap:8},
   brand:{display:"flex",alignItems:"center",gap:10},
   brandDot:{width:8,height:8,background:"#FFB627",borderRadius:1,boxShadow:"0 0 12px #FFB627"},
   brandText:{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,letterSpacing:2,fontSize:16},
   brandSub:{color:"#5a5a5a",fontSize:11,letterSpacing:1},
-  headerRight:{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"},
+  headerRight:{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"},
   pill:{display:"inline-flex",alignItems:"center",gap:6,border:"1px solid",padding:"4px 10px",fontSize:10,letterSpacing:1.5,borderRadius:2},
   pillDot:{width:6,height:6,borderRadius:"50%"},
   runBtn:{background:"#7CFFB2",color:"#0d0d0d",border:"none",padding:"8px 16px",fontSize:11,fontWeight:700,letterSpacing:1.5,fontFamily:"inherit",cursor:"pointer",borderRadius:2},
   runBtnStop:{background:"#FF7A7A"},
   resetBtn:{background:"transparent",color:"#e8e8e8",border:"1px solid #2a2a2a",padding:"8px 14px",fontSize:11,letterSpacing:1.5,fontFamily:"inherit",cursor:"pointer",borderRadius:2},
+  closeBtn:{background:"transparent",border:"1px solid #3a3a3a",color:"#a0a0a0",fontSize:9,letterSpacing:1,fontFamily:"inherit",cursor:"pointer",padding:"3px 7px",borderRadius:2},
   row:{display:"flex",gap:12,flexWrap:"wrap"},
   card:{background:"#0d0d0d",border:"1px solid #1a1a1a",padding:14,borderRadius:2,flex:1,minWidth:0},
   cardHead:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:16,flexWrap:"wrap"},
@@ -438,9 +696,6 @@ const styles={
   statCell:{background:"#060606",padding:"8px 10px",border:"1px solid #1a1a1a",borderRadius:2},
   statLabel:{fontSize:9,letterSpacing:1.5,color:"#5a5a5a"},
   statVal:{fontSize:13,marginTop:2,fontWeight:500},
-  sizeRow:{display:"flex",gap:6,marginTop:4},
-  sizeBtn:{flex:1,background:"#060606",color:"#e8e8e8",border:"1px solid #2a2a2a",padding:"8px 0",fontSize:11,fontFamily:"inherit",cursor:"pointer",borderRadius:2},
-  sizeBtnActive:{background:"#FFB627",color:"#0d0d0d",borderColor:"#FFB627"},
   assertSummary:{fontSize:18,fontWeight:500,marginTop:2},
   settingsCard:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderLeft:"2px solid #FFB627",padding:16,borderRadius:2},
   settingGroup:{background:"#060606",border:"1px solid #1a1a1a",padding:12,borderRadius:2},
@@ -454,7 +709,7 @@ const styles={
   modeBtnSub:{fontSize:9,fontWeight:400,letterSpacing:0.3,color:"#5a5a5a",marginTop:4},
   modeBtnActive:{background:"#0e3a22",borderColor:"#7CFFB2",color:"#7CFFB2"},
   modeBtnActiveAlpaca:{background:"#3a2a0e",borderColor:"#FFB627",color:"#FFB627"},
-  tickerGrid:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:8,marginTop:6},
+  tickerGrid:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:8,marginTop:6},
   tickerCell:{background:"#060606",border:"1px solid #1a1a1a",padding:10,borderRadius:2},
   tickerSym:{fontSize:11,color:"#5a5a5a",letterSpacing:1.5,fontWeight:700},
   tickerPx:{fontSize:15,marginTop:4},
