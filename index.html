@@ -143,7 +143,7 @@ Respond ONLY in this exact JSON format, no markdown, no extra text:
   "leverage": "2x-3x",
   "probability": 72
 }`;
-  const resp=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+  const resp=await fetch(`${PROXY}/claude/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":"","anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
   if(!resp.ok)throw new Error(`Claude API ${resp.status}`);
   const data=await resp.json();
   const text=data.content.filter(b=>b.type==="text").map(b=>b.text).join("");
