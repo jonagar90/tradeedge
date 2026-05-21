@@ -92,8 +92,8 @@ function checkEntry(ticker,price,settings){
   const {minsFromOpen}=getEST();
   const rsi=calcRSI(s.priceHistory);
   if(rsi<settings.rsiMin||rsi>settings.rsiMax) return{pass:false,reason:`RSI ${rsi.toFixed(0)} outside ${settings.rsiMin}-${settings.rsiMax}`};
-  if(s.orbHigh&&price<=s.orbHigh) return{pass:false,reason:`Below ORB $${s.orbHigh.toFixed(2)}`};
-  if(s.vwap&&price<s.vwap) return{pass:false,reason:`Below VWAP $${s.vwap.toFixed(2)}`};
+  if(s.orbHigh&&price<=s.orbHigh) return{pass:false,reason:`Below ORB ${s.orbHigh.toFixed(2)}`};
+  if(s.vwap&&price<s.vwap) return{pass:false,reason:`Below VWAP ${s.vwap.toFixed(2)}`};
   const avgOrbVol=s.orbBarCount>0?s.orbVolSum/s.orbBarCount:0;
   const curVol=s.volumeHistory[s.volumeHistory.length-1]||0;
   const volRatio=avgOrbVol>0?curVol/avgOrbVol:1.5+(Math.random()*0.5);
@@ -133,8 +133,19 @@ const alpaca={
   getPositions:c=>aGet("/v2/positions",c),
   getLatestTrades:async(syms,c)=>{if(!syms.length)return{};const r=await aGet(`/v2/stocks/trades/latest?symbols=${syms.join(",")}&feed=iex`,c,true);return r?.trades||{};},
   getMostActives:async(c,count=20)=>{
-    const r=await aGet(`/v2/stocks/most-actives?by=volume&top=${count}`,c,true);
-    return r?.most_actives||[];
+    // Try both known Alpaca endpoint paths
+    const paths=[
+      `/v1beta1/screener/stocks/most-actives?by=volume&top=${count}`,
+      `/v2/stocks/most-actives?by=volume&top=${count}`,
+    ];
+    for(const path of paths){
+      try{
+        const r=await aGet(path,c,true);
+        const list=r?.most_actives||r?.stocks||[];
+        if(list.length>0)return list;
+      }catch(e){continue;}
+    }
+    return[];
   },
   placeOrder:({symbol,notional,side},c)=>aPost("/v2/orders",{symbol,notional:notional.toFixed(2),side,type:"market",time_in_force:"day"},c),
   closePosition:(sym,c)=>fetch(`${PROXY}/v2/positions/${sym}`,{method:"DELETE",headers:aHeaders(c)}).then(async r=>{if(!r.ok&&r.status!==404){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.status===404?null:r.json();}),
