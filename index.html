@@ -133,8 +133,7 @@ const alpaca={
   getPositions:c=>aGet("/v2/positions",c),
   getLatestTrades:async(syms,c)=>{if(!syms.length)return{};const r=await aGet(`/v2/stocks/trades/latest?symbols=${syms.join(",")}&feed=iex`,c,true);return r?.trades||{};},
   getMostActives:async(c,count=20)=>{
-    // Alpaca most actives screener
-    const r=await aGet(`/v2/screener/stocks/most-actives?by=volume&top=${count}`,c,true);
+    const r=await aGet(`/v2/stocks/most-actives?by=volume&top=${count}`,c,true);
     return r?.most_actives||[];
   },
   placeOrder:({symbol,notional,side},c)=>aPost("/v2/orders",{symbol,notional:notional.toFixed(2),side,type:"market",time_in_force:"day"},c),
