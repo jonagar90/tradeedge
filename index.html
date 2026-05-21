@@ -143,21 +143,11 @@ Respond ONLY in this exact JSON format, no markdown, no extra text:
   "leverage": "2x-3x",
   "probability": 72
 }`;
-
-  const resp=await fetch("https://api.anthropic.com/v1/messages",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-sonnet-4-20250514",
-      max_tokens:1000,
-      messages:[{role:"user",content:prompt}]
-    })
-  });
+  const resp=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
   if(!resp.ok)throw new Error(`Claude API ${resp.status}`);
   const data=await resp.json();
   const text=data.content.filter(b=>b.type==="text").map(b=>b.text).join("");
-  const clean=text.replace(/```json|```/g,"").trim();
-  return JSON.parse(clean);
+  return JSON.parse(text.replace(/```json|```/g,"").trim());
 }
 
 /* ---- Reducer ---- */
@@ -184,10 +174,9 @@ function tradesReducer(state,action){
 }
 
 /* ======= BTC PANEL ======= */
-function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
-  const [tab,setTab]=useState("manual"); // 'manual' | 'ai'
+function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,tradeSize,setTradeSize}){
+  const [tab,setTab]=useState("manual");
   const [manDir,setManDir]=useState("LONG");
-  const [manSize,setManSize]=useState("100");
   const [manTp,setManTp]=useState("");
   const [manSl,setManSl]=useState("");
   const [manMsg,setManMsg]=useState("");
@@ -199,18 +188,16 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
   const btcOrb=getOrb("BTC");
   const rsi=calcRSI(btcOrb.priceHistory);
   const vwap=btcOrb.vwap;
-
   const openBtcTrades=trades.openTrades.filter(t=>t.ticker==="BTC");
 
   const manualEntry=()=>{
     if(!btcPrice){setManMsg("No BTC price yet");return;}
-    const size=Number(manSize);
+    const size=tradeSize;
     const entry=btcPrice;
-    const tpPct=manDir==="LONG"?Number(manTp||settingsRef.current.tpPct):Number(manTp||settingsRef.current.tpPct);
+    const tpPct=Number(manTp||settingsRef.current.tpPct);
     const slPct=Number(manSl||settingsRef.current.slPct);
     const tp=manDir==="LONG"?entry*(1+tpPct/100):entry*(1-tpPct/100);
     const sl=manDir==="LONG"?entry*(1-slPct/100):entry*(1+slPct/100);
-    if(isNaN(size)||size<=0){setManMsg("Enter a valid size");return;}
     const trade={id:`BTC-MAN-${Date.now()}`,ticker:"BTC",direction:manDir,entry,tp,sl,tpPct,slPct,size,vwap:vwap||entry,openedAt:nowIso(),openPrice:entry,manual:true};
     dispatch({type:"OPEN",trade});
     setManMsg(`✓ ${manDir} $${size} entered at $${entry.toFixed(2)}`);
@@ -221,22 +208,19 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
     if(!aiResult||aiResult.setup.direction==="NO TRADE")return;
     const dir=aiResult.setup.direction;
     const entry=btcPrice;
-    const tp=aiResult.setup.tp1||entry*(1+(settingsRef.current.tpPct/100)*(dir==="LONG"?1:-1));
-    const sl=aiResult.setup.stopLoss||entry*(1-(settingsRef.current.slPct/100)*(dir==="LONG"?1:-1));
+    const tp=aiResult.setup.tp1||entry*(1+settingsRef.current.tpPct/100);
+    const sl=aiResult.setup.stopLoss||entry*(1-settingsRef.current.slPct/100);
     const tpPct=Math.abs((tp-entry)/entry*100);
     const slPct=Math.abs((sl-entry)/entry*100);
-    const size=calcPositionSize(100000,entry,slPct);
-    const trade={id:`BTC-AI-${Date.now()}`,ticker:"BTC",direction:dir,entry,tp,sl,tpPct,slPct,size,vwap:vwap||entry,openedAt:nowIso(),openPrice:entry,aiTrade:true};
+    const trade={id:`BTC-AI-${Date.now()}`,ticker:"BTC",direction:dir,entry,tp,sl,tpPct,slPct,size:tradeSize,vwap:vwap||entry,openedAt:nowIso(),openPrice:entry,aiTrade:true};
     dispatch({type:"OPEN",trade});
   };
 
   const runAiAnalysis=async()=>{
     if(!btcPrice){setAiError("No BTC price yet");return;}
     setAiLoading(true);setAiError(null);setAiResult(null);
-    try{
-      const result=await analyzeBTC(btcPrice,btcSeries,rsi,vwap);
-      setAiResult(result);setAiTime(new Date().toLocaleTimeString());
-    }catch(e){setAiError(e.message||String(e));}
+    try{const result=await analyzeBTC(btcPrice,btcSeries,rsi,vwap);setAiResult(result);setAiTime(new Date().toLocaleTimeString());}
+    catch(e){setAiError(e.message||String(e));}
     finally{setAiLoading(false);}
   };
 
@@ -251,7 +235,13 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
           <div style={S.cardLabel}>BTC TRADING PANEL</div>
           <div style={{fontSize:20,fontWeight:500}}>${btcPrice?fmt(btcPrice,2):"—"} <span style={{fontSize:11,color:"#5a5a5a"}}>RSI {rsi.toFixed(0)} · VWAP {vwap?`$${fmt(vwap,2)}`:"—"} · {openBtcTrades.length} open</span></div>
         </div>
-        <div style={{display:"flex",gap:6}}>
+        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+          {/* Trade size presets */}
+          <div style={{display:"flex",gap:4}}>
+            {[10,25,50,100].map(s=>(
+              <button key={s} onClick={()=>setTradeSize(s)} style={{background:tradeSize===s?"#FFB627":"#060606",color:tradeSize===s?"#0d0d0d":"#e8e8e8",border:`1px solid ${tradeSize===s?"#FFB627":"#2a2a2a"}`,padding:"6px 10px",fontSize:11,fontFamily:"inherit",cursor:"pointer",borderRadius:2,fontWeight:tradeSize===s?700:400}}>${s}</button>
+            ))}
+          </div>
           <button onClick={()=>setTab("manual")} style={{...S.resetBtn,...(tab==="manual"?{borderColor:"#FFB627",color:"#FFB627"}:{})}}>MANUAL</button>
           <button onClick={()=>setTab("ai")} style={{...S.resetBtn,...(tab==="ai"?{borderColor:"#7CFFB2",color:"#7CFFB2"}:{})}}>🤖 AI ANALYSIS</button>
         </div>
@@ -260,27 +250,23 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
       {tab==="manual"&&(
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
           <div style={{background:"#060606",border:"1px solid #1a1a1a",padding:12,borderRadius:2}}>
-            <div style={S.cardLabel}>NEW BTC TRADE</div>
+            <div style={S.cardLabel}>NEW BTC TRADE — SIZE: ${tradeSize}</div>
             <div style={{display:"flex",gap:6,marginBottom:10,marginTop:6}}>
               <button onClick={()=>setManDir("LONG")} style={{...S.modeBtn,flex:1,padding:"8px",...(manDir==="LONG"?S.modeBtnActive:{})}}>LONG</button>
               <button onClick={()=>setManDir("SHORT")} style={{...S.modeBtn,flex:1,padding:"8px",...(manDir==="SHORT"?{background:"#3a0e0e",borderColor:"#FF7A7A",color:"#FF7A7A"}:{})}}>SHORT</button>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:10}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
               <label style={{display:"flex",flexDirection:"column",gap:3}}>
-                <div style={S.fieldLabel}>SIZE $</div>
-                <input type="number" value={manSize} onChange={e=>setManSize(e.target.value)} style={S.input} placeholder="100"/>
-              </label>
-              <label style={{display:"flex",flexDirection:"column",gap:3}}>
-                <div style={S.fieldLabel}>TP %</div>
+                <div style={S.fieldLabel}>TP % (default {settingsRef.current.tpPct})</div>
                 <input type="number" value={manTp} onChange={e=>setManTp(e.target.value)} style={S.input} placeholder={settingsRef.current.tpPct}/>
               </label>
               <label style={{display:"flex",flexDirection:"column",gap:3}}>
-                <div style={S.fieldLabel}>SL %</div>
+                <div style={S.fieldLabel}>SL % (default {settingsRef.current.slPct})</div>
                 <input type="number" value={manSl} onChange={e=>setManSl(e.target.value)} style={S.input} placeholder={settingsRef.current.slPct}/>
               </label>
             </div>
             <button onClick={manualEntry} style={{...S.runBtn,width:"100%",background:manDir==="LONG"?"#7CFFB2":"#FF7A7A"}}>
-              EXECUTE {manDir} @ ${btcPrice?fmt(btcPrice,2):"—"}
+              EXECUTE {manDir} ${tradeSize} @ ${btcPrice?fmt(btcPrice,2):"—"}
             </button>
             {manMsg&&<div style={{marginTop:8,fontSize:11,color:"#7CFFB2"}}>{manMsg}</div>}
           </div>
@@ -315,33 +301,31 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
             <button onClick={runAiAnalysis} disabled={aiLoading} style={{...S.testBtn,opacity:aiLoading?0.6:1}}>
               {aiLoading?"🔍 ANALYZING…":"🤖 ANALYZE BTC NOW"}
             </button>
-            {aiTime&&<span style={{fontSize:10,color:"#5a5a5a"}}>last analysis: {aiTime}</span>}
+            {aiTime&&<span style={{fontSize:10,color:"#5a5a5a"}}>last: {aiTime}</span>}
             {aiError&&<span style={{fontSize:11,color:"#FF7A7A"}}>Error: {aiError}</span>}
           </div>
 
           {aiLoading&&(
             <div style={{background:"#060606",border:"1px solid #1a1a1a",padding:20,borderRadius:2,textAlign:"center"}}>
-              <div style={{color:"#FFB627",fontSize:12,letterSpacing:2}}>ANALYZING MARKET STRUCTURE · LIQUIDITY ZONES · ORDER BLOCKS · SMART MONEY…</div>
+              <div style={{color:"#FFB627",fontSize:12,letterSpacing:2}}>ANALYZING MARKET STRUCTURE · LIQUIDITY · ORDER BLOCKS · SMART MONEY…</div>
               <div style={{color:"#5a5a5a",fontSize:10,marginTop:8}}>RSI {rsi.toFixed(0)} · VWAP ${vwap?fmt(vwap,2):"N/A"} · Price ${btcPrice?fmt(btcPrice,2):"—"}</div>
             </div>
           )}
 
           {aiResult&&!aiLoading&&(
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              {/* LEFT: verdict + setup */}
               <div style={{display:"flex",flexDirection:"column",gap:10}}>
                 <div style={{background:"#060606",border:`1px solid ${verdictColor(aiResult.verdict)}`,padding:12,borderRadius:2}}>
                   <div style={S.cardLabel}>FINAL VERDICT</div>
                   <div style={{fontSize:22,fontWeight:700,color:verdictColor(aiResult.verdict),marginTop:4}}>{aiResult.verdict}</div>
-                  <div style={{display:"flex",gap:16,marginTop:8}}>
+                  <div style={{display:"flex",gap:16,marginTop:8,flexWrap:"wrap"}}>
                     <div><div style={S.cardLabel}>BIAS</div><div style={{color:biasColor(aiResult.bias),fontWeight:700}}>{aiResult.bias}</div></div>
-                    <div><div style={S.cardLabel}>CONFIDENCE</div><div style={{color:"#e8e8e8",fontWeight:700}}>{aiResult.confidence}%</div></div>
+                    <div><div style={S.cardLabel}>CONFIDENCE</div><div style={{fontWeight:700}}>{aiResult.confidence}%</div></div>
                     <div><div style={S.cardLabel}>LEVERAGE</div><div style={{color:"#FFB627",fontWeight:700}}>{aiResult.leverage}</div></div>
-                    <div><div style={S.cardLabel}>PROB</div><div style={{color:"#e8e8e8",fontWeight:700}}>{aiResult.probability}%</div></div>
+                    <div><div style={S.cardLabel}>PROB</div><div style={{fontWeight:700}}>{aiResult.probability}%</div></div>
                   </div>
                   <div style={{marginTop:8,fontSize:10,color:"#a0a0a0"}}>{aiResult.confidenceReason}</div>
                 </div>
-
                 <div style={{background:"#060606",border:"1px solid #1a1a1a",padding:12,borderRadius:2}}>
                   <div style={S.cardLabel}>TRADE SETUP — {aiResult.setup.direction}</div>
                   {aiResult.setup.direction!=="NO TRADE"?(
@@ -355,7 +339,7 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
                         <div><div style={S.cardLabel}>DURATION</div><div style={{fontSize:14,fontWeight:500}}>{aiResult.setup.duration}</div></div>
                       </div>
                       <button onClick={executeAiTrade} style={{...S.runBtn,width:"100%",marginTop:10,background:aiResult.setup.direction==="LONG"?"#7CFFB2":"#FF7A7A",color:"#0d0d0d"}}>
-                        ⚡ EXECUTE AI {aiResult.setup.direction} @ ${btcPrice?fmt(btcPrice,2):"—"}
+                        ⚡ EXECUTE AI {aiResult.setup.direction} ${tradeSize} @ ${btcPrice?fmt(btcPrice,2):"—"}
                       </button>
                     </div>
                   ):(
@@ -363,8 +347,6 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
                   )}
                 </div>
               </div>
-
-              {/* RIGHT: analysis details */}
               <div style={{display:"flex",flexDirection:"column",gap:10}}>
                 <div style={{background:"#060606",border:"1px solid #1a1a1a",padding:12,borderRadius:2}}>
                   <div style={S.cardLabel}>MARKET STRUCTURE</div>
@@ -381,21 +363,17 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef}){
                   <div style={{...S.cardLabel,color:"#FFB627"}}>⚠ MARKET WARNINGS</div>
                   <div style={{fontSize:11,color:"#FFB627",marginTop:6,lineHeight:1.5}}>{aiResult.warnings}</div>
                 </div>
-
-                {/* open BTC trades in AI tab */}
                 {openBtcTrades.length>0&&(
                   <div style={{background:"#060606",border:"1px solid #1a1a1a",padding:12,borderRadius:2}}>
                     <div style={S.cardLabel}>OPEN BTC ({openBtcTrades.length})</div>
                     {openBtcTrades.map(o=>{
                       const px=priceRef.current["BTC"]??o.entry;
                       const upl=o.direction==="LONG"?((px-o.entry)/o.entry)*100:((o.entry-px)/o.entry)*100;
-                      return(
-                        <div key={o.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #1a1a1a",fontSize:11}}>
-                          <span style={{color:o.direction==="LONG"?"#7CFFB2":"#FF7A7A"}}>{o.direction} {o.aiTrade?"🤖":"✋"} ${fmt(o.entry,2)}</span>
-                          <span style={{color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</span>
-                          <button onClick={()=>{const cpx=priceRef.current["BTC"]??o.entry;dispatch({type:"CLOSE",tradeId:o.id,closePrice:cpx,reason:"MANUAL",t:Date.now(),tolerance:10});}} style={S.closeBtn}>CLOSE</button>
-                        </div>
-                      );
+                      return(<div key={o.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid #1a1a1a",fontSize:11}}>
+                        <span style={{color:o.direction==="LONG"?"#7CFFB2":"#FF7A7A"}}>{o.direction} {o.aiTrade?"🤖":"✋"} ${fmt(o.entry,2)}</span>
+                        <span style={{color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</span>
+                        <button onClick={()=>{const cpx=priceRef.current["BTC"]??o.entry;dispatch({type:"CLOSE",tradeId:o.id,closePrice:cpx,reason:"MANUAL",t:Date.now(),tolerance:10});}} style={S.closeBtn}>CLOSE</button>
+                      </div>);
                     })}
                   </div>
                 )}
@@ -414,6 +392,7 @@ function App(){
   const [settings,setSettings]=useState(DEFAULT_SETTINGS);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [tradeSize,setTradeSize]=useState(25);
+  const [signals,setSignals]=useState([]);
   const [trades,dispatch]=useReducer(tradesReducer,initialState);
   const [dailyLoss,setDailyLoss]=useState(0);
   const [circuitBreaker,setCircuitBreaker]=useState(false);
@@ -451,18 +430,12 @@ function App(){
   useEffect(()=>{
     if(settings.scanMode!=="actives"||connStatus.state!=="connected")return;
     let cancelled=false;
-    const scan=async()=>{
-      try{const actives=await alpaca.getMostActives(credsRef.current,settingsRef.current.mostActivesCount);if(cancelled)return;const syms=actives.map(a=>a.symbol).filter(Boolean);setActiveTickers(syms);setActivesLastScan(new Date().toISOString());setStockPrices(prev=>{const next={...prev};for(const a of actives){if(a.symbol&&a.price)next[a.symbol]=a.price;}return next;});}
-      catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`actives scan: ${e.message||e}`},...p.slice(0,9)]);}
-    };
+    const scan=async()=>{try{const actives=await alpaca.getMostActives(credsRef.current,settingsRef.current.mostActivesCount);if(cancelled)return;const syms=actives.map(a=>a.symbol).filter(Boolean);setActiveTickers(syms);setActivesLastScan(new Date().toISOString());setStockPrices(prev=>{const next={...prev};for(const a of actives){if(a.symbol&&a.price)next[a.symbol]=a.price;}return next;});}catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`actives scan: ${e.message||e}`},...p.slice(0,9)]);}};
     scan();const id=setInterval(scan,settings.activeScanIntervalMs);return()=>{cancelled=true;clearInterval(id);};
   },[settings.scanMode,settings.activeScanIntervalMs,connStatus.state]);
 
   useEffect(()=>{const id=setInterval(()=>{const{h,m}=getEST();if(h===9&&m===30){setDailyLoss(0);setCircuitBreaker(false);}},60000);return()=>clearInterval(id);},[]);
-  useEffect(()=>{
-    const id=setInterval(()=>{const{h,m}=getEST();const s=settingsRef.current;if(h===s.forceCloseHour&&m===s.forceCloseMin){const open=tradesRef.current.openTrades;const now=Date.now();for(const trade of open){const px=priceRef.current[trade.ticker]??trade.entry;dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"EOD",t:now,tolerance:10});}}},30000);
-    return()=>clearInterval(id);
-  },[]);
+  useEffect(()=>{const id=setInterval(()=>{const{h,m}=getEST();const s=settingsRef.current;if(h===s.forceCloseHour&&m===s.forceCloseMin){const open=tradesRef.current.openTrades;const now=Date.now();for(const trade of open){const px=priceRef.current[trade.ticker]??trade.entry;dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"EOD",t:now,tolerance:10});}}},30000);return()=>clearInterval(id);},[]);
 
   const testConnection=async()=>{if(!creds.keyId||!creds.secret){setConnStatus({state:"error",message:"paste API Key ID and Secret first"});return;}setConnStatus({state:"testing",message:"calling /v2/account…"});try{const acct=await alpaca.getAccount(creds);setAlpacaAccount(acct);setConnStatus({state:"connected",message:`${acct.account_number} · $${Number(acct.buying_power).toLocaleString()} bp`});}catch(e){setConnStatus({state:"error",message:String(e.message||e)});setAlpacaAccount(null);}};
 
@@ -482,7 +455,6 @@ function App(){
   },[settings.pollMs]);
 
   useEffect(()=>{const id=setInterval(()=>{if(btcLastFetch)setStale(Date.now()-btcLastFetch>settingsRef.current.pollMs*2);},2000);return()=>clearInterval(id);},[btcLastFetch]);
-
   useEffect(()=>{if(connStatus.state==="connected")return;const id=setInterval(()=>{const vol=settingsRef.current.stockVolPct/100;setStockPrices(prev=>{const next={...prev};for(const t of activeTickersRef.current){const base=prev[t]||100;next[t]=Math.max(1,base+randn()*base*vol);updateOrbVwap(t,next[t],Math.floor(500+Math.random()*1500));}return next;});},settings.stockTickMs);return()=>clearInterval(id);},[settings.stockTickMs,connStatus.state,activeTickers]);
 
   useEffect(()=>{
@@ -557,7 +529,6 @@ function App(){
 
       {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} dailyLoss={dailyLoss} activesLastScan={activesLastScan}/>}
 
-      {/* BTC + stats */}
       <section style={S.row}>
         <div style={{...S.card,flex:2}}>
           <div style={S.cardHead}>
@@ -566,8 +537,7 @@ function App(){
             </div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(5,auto)",gap:16}}>
               <Diag label="SOURCE" value={btcSource||"—"} bad={!btcSource}/><Diag label="LAST POLL" value={btcLastFetch?shortTime(new Date(btcLastFetch).toISOString()):"—"}/>
-              <Diag label="POLLS" value={btcPolls}/><Diag label="ERRORS" value={btcErrors} bad={btcErrors>0}/>
-              <Diag label="CADENCE" value={`${settings.pollMs/1000}s`}/>
+              <Diag label="POLLS" value={btcPolls}/><Diag label="ERRORS" value={btcErrors} bad={btcErrors>0}/><Diag label="CADENCE" value={`${settings.pollMs/1000}s`}/>
             </div>
           </div>
           <div style={{height:190,marginTop:12}}>
@@ -597,15 +567,17 @@ function App(){
             <div style={{fontSize:16,fontWeight:500,color:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#e8e8e8",marginTop:4}}>-${fmt(dailyLoss,2)} <span style={{fontSize:10,color:"#5a5a5a"}}>/ ${settings.dailyLossLimit}</span></div>
             <div style={{marginTop:6,height:4,background:"#1a1a1a",borderRadius:2}}><div style={{height:"100%",width:`${Math.min(100,(dailyLoss/settings.dailyLossLimit)*100)}%`,background:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#7CFFB2",borderRadius:2}}/></div>
           </div>
+          <div style={{marginTop:10}}>
+            <div style={S.cardLabel}>ASSERTIONS</div>
+            <div style={S.assertSummary}><span style={{color:"#7CFFB2"}}>{stats.assertionsPassed}</span><span style={{color:"#5a5a5a"}}> / </span><span>{stats.assertionsTotal}</span><span style={{fontSize:10,color:"#5a5a5a",marginLeft:6}}>exits verified</span></div>
+          </div>
         </div>
       </section>
 
-      {/* BTC TRADING PANEL */}
-      <BTCPanel btcPrice={btcPrice} btcSeries={btcSeries} trades={trades} dispatch={dispatch} priceRef={priceRef} settingsRef={settingsRef} tradeSize={tradeSize}/>
+      <BTCPanel btcPrice={btcPrice} btcSeries={btcSeries} trades={trades} dispatch={dispatch} priceRef={priceRef} settingsRef={settingsRef} tradeSize={tradeSize} setTradeSize={setTradeSize}/>
 
       {connStatus.state==="connected"&&alpacaAccount&&<AlpacaAccountCard account={alpacaAccount} positions={alpacaPositions} mode={execMode} errors={alpacaErrors}/>}
 
-      {/* Equity */}
       <section style={S.card}>
         <div style={S.cardLabel}>EQUITY CURVE</div>
         <div style={{height:100,marginTop:8}}>
@@ -621,7 +593,6 @@ function App(){
         </div>
       </section>
 
-      {/* Tickers */}
       <section style={S.card}>
         <div style={S.cardLabel}>{settings.scanMode==="actives"?`MOST ACTIVES — ${activeTickers.length} · last scan ${activesLastScan?shortTime(activesLastScan):"—"}`:`WATCHLIST — ${activeTickers.length}`}{connStatus.state==="connected"?" (IEX · 5s)":" (sim)"}</div>
         <div style={S.tickerGrid}>
@@ -639,7 +610,6 @@ function App(){
         </div>
       </section>
 
-      {/* Open + journal */}
       <section style={S.row}>
         <div style={{...S.card,flex:1}}>
           <div style={S.cardLabel}>OPEN POSITIONS ({trades.openTrades.filter(t=>t.ticker!=="BTC").length})</div>
@@ -663,7 +633,6 @@ function App(){
         </div>
       </section>
 
-      {/* Scan logs */}
       <section style={S.row}>
         <div style={{...S.card,flex:1}}>
           <div style={S.cardLabel}>ENTRIES TAKEN ({signals.length})</div>
