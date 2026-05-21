@@ -33,18 +33,27 @@ const DEFAULT_SETTINGS = {
   startingBalance: 10000,
   maxTradeSize: 100,
   dailyLossLimit: 200,
-  tpPct1: 5,   // TP1
-  tpPct2: 10,  // TP2
-  slPct: 3,    // hard stop
+  tpPct1: 5,
+  tpPct2: 10,
+  slPct: 3,
   rsiMin: 60, rsiMax: 80,
-  rvolEntry: 5,    // min RVOL to enter
-  rvolExit: 3,     // exit if RVOL drops below this
-  gapMinPct: 10,   // min gap % for pre-market radar
+  rvolEntry: 5,
+  rvolExit: 3,
+  gapMinPct: 10,
   priceMin: 1, priceMax: 20,
   scanIntervalMs: 60000,
   pollMs: 15000,
   mostActivesCount: 30,
   assertTolerancePct: 0.5,
+  // Strategy modes
+  gapMomentumEnabled: true,   // 9:30-10:30am gap breakout
+  continuationEnabled: false, // 9:30am-3:30pm all-day continuation
+  // Continuation-specific settings
+  contRsiMin: 55, contRsiMax: 80,
+  contRvolMin: 2,
+  contMinMove: 3,   // min % move from open to consider continuation
+  contTpPct: 3,     // tighter TP for continuation
+  contSlPct: 1.5,   // tighter SL for continuation
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -207,7 +216,57 @@ function checkMomentumEntry(ticker, settings){
 }
 
 /* ============================================================
-   ALPACA HELPERS
+   CONTINUATION BREAKOUT ENTRY (9:30am - 3:30pm)
+   - Stock already moving 3%+ from open
+   - RVOL 2x+ (lower bar than gap setup)
+   - RSI 55-80
+   - Price above VWAP
+   - New 5-min high breakout (price > recent high)
+   - Tighter TP/SL: +3% / -1.5%
+   ============================================================ */
+function checkContinuationEntry(ticker, settings){
+  const d=getMkt(ticker);
+  const {minsFromOpen,isMarketOpen}=getEST();
+  const rsi=calcRSI(d.priceHistory);
+
+  if(!isMarketOpen) return{pass:false,reason:"Market closed"};
+  if(minsFromOpen<1) return{pass:false,reason:"Waiting for market open"};
+  if(minsFromOpen>360) return{pass:false,reason:"After 3:30pm cutoff"};
+  if(!d.open||d.open<=0) return{pass:false,reason:"No open price yet"};
+
+  // Price filter
+  if(d.price<settings.priceMin||d.price>settings.priceMax)
+    return{pass:false,reason:`Price ${d.price.toFixed(2)} outside range`};
+
+  // Must be moving 3%+ from open (already has momentum)
+  const moveFromOpen=((d.price-d.open)/d.open)*100;
+  if(moveFromOpen<settings.contMinMove)
+    return{pass:false,reason:`Move ${moveFromOpen.toFixed(1)}% < ${settings.contMinMove}% min from open`};
+
+  // RVOL check (lower bar than gap strategy)
+  if(d.rvol>0&&d.rvol<settings.contRvolMin)
+    return{pass:false,reason:`RVOL ${d.rvol.toFixed(1)}x < ${settings.contRvolMin}x`};
+
+  // RSI check
+  if(rsi<settings.contRsiMin||rsi>settings.contRsiMax)
+    return{pass:false,reason:`RSI ${rsi.toFixed(0)} outside ${settings.contRsiMin}-${settings.contRsiMax}`};
+
+  // Price above VWAP
+  if(d.vwap>0&&d.price<d.vwap)
+    return{pass:false,reason:`Below VWAP ${d.vwap.toFixed(2)}`};
+
+  // New high breakout — price must be at or near recent high (top 5% of price history)
+  const recentHigh=d.priceHistory.length>0?Math.max(...d.priceHistory):d.price;
+  const pctFromHigh=((recentHigh-d.price)/recentHigh)*100;
+  if(pctFromHigh>2)
+    return{pass:false,reason:`Price ${pctFromHigh.toFixed(1)}% below recent high — not breaking out`};
+
+  return{
+    pass:true, rsi, rvol:d.rvol, moveFromOpen,
+    vwap:d.vwap, recentHigh,
+    strategy:"CONTINUATION",
+  };
+}
    ============================================================ */
 const aHeaders=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
 async function aGet(path,creds,data=false){
@@ -704,32 +763,67 @@ function App(){
       const open=new Set(tradesRef.current.openTrades.map(t=>t.ticker));
       const balance=tradesRef.current.balance;
       const s=settingsRef.current;
+      const {minsFromOpen}=getEST();
+
       for(const ticker of scanTickersRef.current){
         if(open.has(ticker))continue;
-        const check=checkMomentumEntry(ticker,s);
-        if(check.preMarket){
-          // Just log to radar, don't trade
-          continue;
-        }
-        if(!check.pass){
-          setScanLog(p=>[{t:nowIso(),ticker,reason:check.reason},...p.slice(0,49)]);
-          continue;
-        }
-        // ENTRY
-        const px=priceRef.current[ticker];if(!px)continue;
         const d=getMkt(ticker);
-        const sl=Math.max(d.firstCandleLow,px*(1-s.slPct/100)); // use first candle low or hard stop
-        const tp1=px*(1+s.tpPct1/100);
-        const tp2=px*(1+s.tpPct2/100);
+        if(!d.price)continue;
+
+        let check=null;
+        let strategy=null;
+
+        // Try gap momentum strategy first (9:30-10:30am)
+        if(s.gapMomentumEnabled&&minsFromOpen>=0&&minsFromOpen<=60){
+          const c=checkMomentumEntry(ticker,s);
+          if(c.pass){check=c;strategy="GAP";}
+          else if(!c.preMarket){
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`[GAP] ${c.reason}`},...p.slice(0,49)]);
+          }
+        }
+
+        // Try continuation strategy (all day 9:30-3:30pm)
+        if(!check&&s.continuationEnabled&&minsFromOpen>=1&&minsFromOpen<=360){
+          const c=checkContinuationEntry(ticker,s);
+          if(c.pass){check=c;strategy="CONT";}
+          else{
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`[CONT] ${c.reason}`},...p.slice(0,49)]);
+          }
+        }
+
+        if(!check)continue;
+
+        // Determine TP/SL based on strategy
+        const px=d.price;
+        const tpPct=strategy==="GAP"?s.tpPct1:s.contTpPct;
+        const slPct=strategy==="GAP"?s.slPct:s.contSlPct;
+        const sl=strategy==="GAP"
+          ?Math.max(d.firstCandleLow||px*(1-slPct/100), px*(1-slPct/100))
+          :px*(1-slPct/100);
+        const tp=px*(1+tpPct/100);
+        const tp2=strategy==="GAP"?px*(1+s.tpPct2/100):null;
         const size=Math.min(s.maxTradeSize,balance*0.02);
-        const sig={ticker,direction:"LONG",entry:px,tp:tp1,tp2,sl,tpPct:s.tpPct1,slPct:((px-sl)/px*100),size,rvol:d.rvol,gapPct:d.gapPct,rsi:calcRSI(d.priceHistory),vwap:d.vwap,firstCandleHigh:d.firstCandleHigh,rr:check.rr};
+        const rr=((tp-px)/(px-sl));
+
+        const sig={
+          ticker,direction:"LONG",entry:px,tp,tp2,sl,
+          tpPct,slPct,size,rvol:d.rvol,gapPct:d.gapPct,
+          rsi:calcRSI(d.priceHistory),vwap:d.vwap,
+          firstCandleHigh:d.firstCandleHigh,rr,strategy,
+        };
         setSignals(prev=>[{...sig,id:`${ticker}-${Date.now()}`,createdAt:nowIso()},...prev].slice(0,50));
+
         let alpacaOrderId=null;
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
           try{const order=await alpaca.placeOrder({symbol:ticker,notional:size,side:"buy"},credsRef.current);alpacaOrderId=order.id;}
           catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);continue;}
         }
-        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp:tp1,tp2,sl,slPct:((px-sl)/px*100),tpPct:s.tpPct1,size,vwap:d.vwap,rvol:d.rvol,gapPct:d.gapPct,openedAt:nowIso(),openPrice:px,alpacaOrderId}});
+        dispatch({type:"OPEN",trade:{
+          id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",
+          entry:px,tp,tp2,sl,slPct,tpPct,size,
+          vwap:d.vwap,rvol:d.rvol,gapPct:d.gapPct,
+          strategy,openedAt:nowIso(),openPrice:px,alpacaOrderId,
+        }});
         open.add(ticker);
       }
     };
@@ -901,6 +995,7 @@ function App(){
                       <td style={{...S.tdR,color:"#5a5a5a"}}>{d.firstCandleHigh>0?`H:$${fmt(d.firstCandleHigh,2)}`:"—"}</td>
                       <td style={{...S.td,fontSize:9,color:check.pass?"#7CFFB2":check.preMarket?"#7CFFB2":"#5a5a5a"}}>
                         {check.pass?"✅ ENTRY READY":check.preMarket?"🌅 "+check.reason.split("—")[0]:check.reason}
+                        {!check.pass&&settings.continuationEnabled&&(()=>{const cc=checkContinuationEntry(ticker,settings);return cc.pass?<span style={{color:"#FFB627",marginLeft:6}}>· CONT ✅</span>:null;})()}
                       </td>
                     </tr>
                   );
@@ -917,7 +1012,7 @@ function App(){
           <div style={S.cardLabel}>OPEN POSITIONS ({trades.openTrades.filter(t=>t.ticker!=="BTC").length})</div>
           {!trades.openTrades.filter(t=>t.ticker!=="BTC").length?<div style={S.empty}>{running?"scanning for momentum setups…":"press START to begin"}</div>:(
             <table style={S.table}>
-              <thead><tr><th style={S.th}>SYM</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP1</th><th style={S.thR}>SL</th><th style={S.thR}>RVOL</th><th style={S.thR}>UPL</th><th style={S.th}></th></tr></thead>
+              <thead><tr><th style={S.th}>SYM</th><th style={S.th}>MODE</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP1</th><th style={S.thR}>SL</th><th style={S.thR}>RVOL</th><th style={S.thR}>UPL</th><th style={S.th}></th><th style={S.th}></th></tr></thead>
               <tbody>{trades.openTrades.filter(t=>t.ticker!=="BTC").map(o=>{
                 const px=priceRef.current[o.ticker]??o.entry;
                 const upl=((px-o.entry)/o.entry)*100;
@@ -927,6 +1022,7 @@ function App(){
                   <td style={{...S.tdR,color:"#7CFFB2"}}>${fmt(o.tp,2)}</td><td style={{...S.tdR,color:"#FF7A7A"}}>${fmt(o.sl,2)}</td>
                   <td style={{...S.tdR,color:d.rvol<settings.rvolExit?"#FF7A7A":"#7CFFB2"}}>{d.rvol>0?`${d.rvol.toFixed(1)}x`:"—"}</td>
                   <td style={{...S.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</td>
+                  <td style={S.td}><span style={{fontSize:9,padding:"2px 6px",borderRadius:1,background:o.strategy==="GAP"?"#0e3a22":"#3a2a0e",color:o.strategy==="GAP"?"#7CFFB2":"#FFB627"}}>{o.strategy||"GAP"}</span></td>
                   <td style={S.td}><button onClick={()=>manualClose(o)} style={S.closeBtn}>CLOSE</button></td>
                 </tr>);
               })}</tbody>
@@ -1013,7 +1109,32 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
         <div style={{display:"flex",gap:8}}><button onClick={onReset} style={styles.resetBtn}>RESTORE DEFAULTS</button><button onClick={onClose} style={styles.resetBtn}>CLOSE</button></div>
       </div>
 
-      {/* Anthropic */}
+      {/* Strategy Mode Toggles */}
+      <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
+        <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>STRATEGY MODES</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <button onClick={()=>set("gapMomentumEnabled",!settings.gapMomentumEnabled)} style={{...styles.modeBtn,...(settings.gapMomentumEnabled?styles.modeBtnActive:{})}}>
+            GAP MOMENTUM
+            <div style={styles.modeBtnSub}>9:30–10:30am · gap 10%+ breakout</div>
+            <div style={{marginTop:6,fontSize:9,color:settings.gapMomentumEnabled?"#7CFFB2":"#5a5a5a",letterSpacing:1}}>{settings.gapMomentumEnabled?"● ENABLED":"○ DISABLED"}</div>
+          </button>
+          <button onClick={()=>set("continuationEnabled",!settings.continuationEnabled)} style={{...styles.modeBtn,...(settings.continuationEnabled?styles.modeBtnActiveAlpaca:{})}}>
+            CONTINUATION
+            <div style={styles.modeBtnSub}>9:30am–3:30pm · all-day momentum</div>
+            <div style={{marginTop:6,fontSize:9,color:settings.continuationEnabled?"#FFB627":"#5a5a5a",letterSpacing:1}}>{settings.continuationEnabled?"● ENABLED":"○ DISABLED"}</div>
+          </button>
+        </div>
+        {settings.continuationEnabled&&(
+          <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+            <NumField label="MIN MOVE FROM OPEN %" value={settings.contMinMove} min={1} max={20} step={0.5} onChange={v=>set("contMinMove",v)} help="stock must be up X% from open"/>
+            <NumField label="MIN RVOL" value={settings.contRvolMin} min={1} max={10} step={0.5} onChange={v=>set("contRvolMin",v)} help="lower than gap strategy"/>
+            <NumField label="RSI MIN" value={settings.contRsiMin} min={40} max={70} step={1} onChange={v=>set("contRsiMin",v)}/>
+            <NumField label="RSI MAX" value={settings.contRsiMax} min={60} max={95} step={1} onChange={v=>set("contRsiMax",v)}/>
+            <NumField label="TP %" value={settings.contTpPct} min={0.5} max={10} step={0.5} onChange={v=>set("contTpPct",v)} help="tighter TP for continuation"/>
+            <NumField label="SL %" value={settings.contSlPct} min={0.5} max={5} step={0.5} onChange={v=>set("contSlPct",v)} help="tighter SL for continuation"/>
+          </div>
+        )}
+      </div>
       <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>ANTHROPIC API KEY — BTC AI</div>
         <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ memory only · never shared · console.anthropic.com</div>
