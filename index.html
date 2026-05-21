@@ -39,6 +39,7 @@ const DEFAULT_SETTINGS = {
   scanMode:"watchlist",
   watchlist:DEFAULT_WATCHLIST,
   mostActivesCount:20,
+  maxTradeSize:100, // max dollars per stock trade
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -78,10 +79,15 @@ function checkEntry(ticker,price,settings){
   if(avgOrbVol>0&&volRatio<settings.volumeMultiplier)return{pass:false,reason:`Vol ${volRatio.toFixed(2)}x < ${settings.volumeMultiplier}x`};
   return{pass:true,rsi,volRatio,vwap:s.vwap||price,orbHigh:s.orbHigh||price};
 }
-function calcPositionSize(balance,entryPrice,slPct){return Math.min(Math.max(10,(balance*0.01)/(entryPrice*(slPct/100))*entryPrice),balance*0.2);}
+function calcPositionSize(balance,entryPrice,slPct,maxSize){
+  const risk=balance*0.01;
+  const slDist=entryPrice*(slPct/100);
+  const calculated=Math.max(10,(risk/slDist)*entryPrice);
+  return Math.min(calculated, maxSize||100);
+}
 const makeSignal=(ticker,price,settings,balance)=>{
   const check=checkEntry(ticker,price,settings);const s=getOrb(ticker);
-  return{id:`${ticker}-${Date.now()}-${Math.floor(Math.random()*1e4)}`,ticker,direction:"LONG",entry:price,tp:price*(1+settings.tpPct/100),sl:price*(1-settings.slPct/100),tpPct:settings.tpPct,slPct:settings.slPct,rsi:calcRSI(s.priceHistory),vwap:s.vwap||price,orbHigh:s.orbHigh||price,volRatio:check.volRatio||0,entryCondition:check,notional:calcPositionSize(balance,price,settings.slPct),createdAt:nowIso()};
+  return{id:`${ticker}-${Date.now()}-${Math.floor(Math.random()*1e4)}`,ticker,direction:"LONG",entry:price,tp:price*(1+settings.tpPct/100),sl:price*(1-settings.slPct/100),tpPct:settings.tpPct,slPct:settings.slPct,rsi:calcRSI(s.priceHistory),vwap:s.vwap||price,orbHigh:s.orbHigh||price,volRatio:check.volRatio||0,entryCondition:check,notional:calcPositionSize(balance,price,settings.slPct,settings.maxTradeSize),createdAt:nowIso()};
 };
 
 /* ---- Alpaca ---- */
@@ -143,7 +149,7 @@ Respond ONLY in this exact JSON format, no markdown, no extra text:
   "leverage": "2x-3x",
   "probability": 72
 }`;
-  const resp=await fetch(`${PROXY}/claude/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":anthropicKey,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+  const resp=await fetch(`${PROXY}/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":anthropicKey,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
   if(!resp.ok)throw new Error(`Claude API ${resp.status}`);
   const data=await resp.json();
   const text=data.content.filter(b=>b.type==="text").map(b=>b.text).join("");
@@ -712,7 +718,7 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(210px,1fr))",gap:14}}>
         <SettingGroup title="STRATEGY"><NumField label="TAKE PROFIT %" value={settings.tpPct} min={0.5} max={20} step={0.5} onChange={v=>set("tpPct",v)}/><NumField label="STOP LOSS %" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)}/><NumField label="RSI MIN" value={settings.rsiMin} min={30} max={70} step={1} onChange={v=>set("rsiMin",v)}/><NumField label="RSI MAX" value={settings.rsiMax} min={50} max={95} step={1} onChange={v=>set("rsiMax",v)}/><NumField label="VOL MULTIPLIER" value={settings.volumeMultiplier} min={1} max={5} step={0.1} onChange={v=>set("volumeMultiplier",v)}/></SettingGroup>
-        <SettingGroup title="RISK"><NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={5000} step={50} onChange={v=>set("dailyLossLimit",v)}/><NumField label="FORCE CLOSE HOUR" value={settings.forceCloseHour} min={14} max={16} step={1} onChange={v=>set("forceCloseHour",v)}/><NumField label="FORCE CLOSE MIN" value={settings.forceCloseMin} min={0} max={59} step={1} onChange={v=>set("forceCloseMin",v)}/></SettingGroup>
+        <SettingGroup title="RISK"><NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)} help="max $ per stock entry — overrides 1% risk calc"/><NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={5000} step={50} onChange={v=>set("dailyLossLimit",v)}/><NumField label="FORCE CLOSE HOUR" value={settings.forceCloseHour} min={14} max={16} step={1} onChange={v=>set("forceCloseHour",v)}/><NumField label="FORCE CLOSE MIN" value={settings.forceCloseMin} min={0} max={59} step={1} onChange={v=>set("forceCloseMin",v)}/></SettingGroup>
         <SettingGroup title="TIMING"><NumField label="STOCK TICK MS" value={settings.stockTickMs} min={250} max={10000} step={250} onChange={v=>set("stockTickMs",v)}/><NumField label="BTC POLL MS" value={settings.pollMs} min={10000} max={120000} step={1000} onChange={v=>set("pollMs",v)}/><NumField label="SCAN INTERVAL MS" value={settings.signalIntervalMs} min={1000} max={60000} step={500} onChange={v=>set("signalIntervalMs",v)}/><NumField label="ACTIVES REFRESH MS" value={settings.activeScanIntervalMs} min={30000} max={300000} step={10000} onChange={v=>set("activeScanIntervalMs",v)}/></SettingGroup>
       </div>
     </section>
