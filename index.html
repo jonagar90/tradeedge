@@ -107,7 +107,19 @@ const alpaca={
   closePosition:(sym,c)=>fetch(`${PROXY}/v2/positions/${sym}`,{method:"DELETE",headers:aHeaders(c)}).then(async r=>{if(!r.ok&&r.status!==404){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.status===404?null:r.json();}),
 };
 
-/* ---- Claude AI BTC analysis ---- */
+async function closeAlpacaPosition(ticker, creds) {
+  // Try up to 3 times
+  for(let i=0;i<3;i++){
+    try{
+      const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aHeaders(creds)});
+      if(r.ok||r.status===404)return true;
+      await new Promise(res=>setTimeout(res,500));
+    }catch(e){
+      await new Promise(res=>setTimeout(res,500));
+    }
+  }
+  return false;
+}
 async function analyzeBTC(btcPrice,btcSeries,rsi,vwap,anthropicKey){
   const prices=btcSeries.slice(-20).map(p=>p.p);
   const high=Math.max(...prices),low=Math.min(...prices);
@@ -475,6 +487,12 @@ function App(){
       else{if(px<=trade.tp)hit="TP";else if(px>=trade.sl)hit="SL";else if(trade.vwap&&px>trade.vwap)hit="VWAP";}
       if(hit){
         const closePrice=hit==="TP"?trade.tp:px;
+        // Always try to close Alpaca position on any exit
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&trade.ticker!=="BTC"){
+          closeAlpacaPosition(trade.ticker,credsRef.current).then(ok=>{
+            if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed to close ${trade.ticker} after ${hit} — close manually in Alpaca`},...p.slice(0,9)]);
+          });
+        }
         if(hit==="SL"||hit==="VWAP"){const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);setDailyLoss(d=>{const nl=d+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});}
         dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now,tolerance:tol});
       }
@@ -502,7 +520,15 @@ function App(){
     fire();const id=setInterval(fire,settings.signalIntervalMs);return()=>clearInterval(id);
   },[running,settings.signalIntervalMs,connStatus.state,circuitBreaker]);
 
-  const manualClose=(trade)=>{const px=priceRef.current[trade.ticker]??trade.entry;dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now(),tolerance:settingsRef.current.assertTolerancePct});};
+  const manualClose=(trade)=>{
+    const px=priceRef.current[trade.ticker]??trade.entry;
+    if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&trade.ticker!=="BTC"){
+      closeAlpacaPosition(trade.ticker,credsRef.current).then(ok=>{
+        if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed to close ${trade.ticker} — close manually in Alpaca`},...p.slice(0,9)]);
+      });
+    }
+    dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now(),tolerance:settingsRef.current.assertTolerancePct});
+  };
 
   const stats=useMemo(()=>{
     const closed=trades.closedTrades;const wins=closed.filter(t=>t.pnl>0),losses=closed.filter(t=>t.pnl<0);
