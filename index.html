@@ -102,7 +102,7 @@ const alpaca={
 };
 
 /* ---- Claude AI BTC analysis ---- */
-async function analyzeBTC(btcPrice,btcSeries,rsi,vwap){
+async function analyzeBTC(btcPrice,btcSeries,rsi,vwap,anthropicKey){
   const prices=btcSeries.slice(-20).map(p=>p.p);
   const high=Math.max(...prices),low=Math.min(...prices);
   const change1h=prices.length>1?((prices[prices.length-1]-prices[0])/prices[0]*100).toFixed(2):0;
@@ -143,7 +143,7 @@ Respond ONLY in this exact JSON format, no markdown, no extra text:
   "leverage": "2x-3x",
   "probability": 72
 }`;
-  const resp=await fetch(`${PROXY}/claude/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":"","anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+  const resp=await fetch(`${PROXY}/claude/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":anthropicKey,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
   if(!resp.ok)throw new Error(`Claude API ${resp.status}`);
   const data=await resp.json();
   const text=data.content.filter(b=>b.type==="text").map(b=>b.text).join("");
@@ -174,7 +174,7 @@ function tradesReducer(state,action){
 }
 
 /* ======= BTC PANEL ======= */
-function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,tradeSize,setTradeSize}){
+function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,tradeSize,setTradeSize,anthropicKey}){
   const [tab,setTab]=useState("manual");
   const [manDir,setManDir]=useState("LONG");
   const [manTp,setManTp]=useState("");
@@ -218,8 +218,9 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
 
   const runAiAnalysis=async()=>{
     if(!btcPrice){setAiError("No BTC price yet");return;}
+    if(!anthropicKey){setAiError("Add your Anthropic API key in ⚙ Settings");return;}
     setAiLoading(true);setAiError(null);setAiResult(null);
-    try{const result=await analyzeBTC(btcPrice,btcSeries,rsi,vwap);setAiResult(result);setAiTime(new Date().toLocaleTimeString());}
+    try{const result=await analyzeBTC(btcPrice,btcSeries,rsi,vwap,anthropicKey);setAiResult(result);setAiTime(new Date().toLocaleTimeString());}
     catch(e){setAiError(e.message||String(e));}
     finally{setAiLoading(false);}
   };
@@ -400,6 +401,7 @@ function App(){
   const [activeTickers,setActiveTickers]=useState(DEFAULT_WATCHLIST);
   const [activesLastScan,setActivesLastScan]=useState(null);
   const [stockPrices,setStockPrices]=useState(()=>Object.fromEntries(DEFAULT_WATCHLIST.map(t=>[t,100+Math.random()*400])));
+  const [anthropicKey,setAnthropicKey]=useState("");
   const [creds,setCreds]=useState({keyId:"",secret:""});
   const [execMode,setExecMode]=useState("simulated");
   const [connStatus,setConnStatus]=useState({state:"disconnected",message:""});
@@ -527,7 +529,7 @@ function App(){
         </div>
       </header>
 
-      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} dailyLoss={dailyLoss} activesLastScan={activesLastScan}/>}
+      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} dailyLoss={dailyLoss} activesLastScan={activesLastScan} anthropicKey={anthropicKey} onAnthropicKeyChange={setAnthropicKey}/>}
 
       <section style={S.row}>
         <div style={{...S.card,flex:2}}>
@@ -574,7 +576,7 @@ function App(){
         </div>
       </section>
 
-      <BTCPanel btcPrice={btcPrice} btcSeries={btcSeries} trades={trades} dispatch={dispatch} priceRef={priceRef} settingsRef={settingsRef} tradeSize={tradeSize} setTradeSize={setTradeSize}/>
+      <BTCPanel btcPrice={btcPrice} btcSeries={btcSeries} trades={trades} dispatch={dispatch} priceRef={priceRef} settingsRef={settingsRef} tradeSize={tradeSize} setTradeSize={setTradeSize} anthropicKey={anthropicKey}/>
 
       {connStatus.state==="connected"&&alpacaAccount&&<AlpacaAccountCard account={alpacaAccount} positions={alpacaPositions} mode={execMode} errors={alpacaErrors}/>}
 
@@ -663,7 +665,7 @@ function AlpacaAccountCard({account,positions,mode,errors}){
   return<section style={{...styles.card,borderLeft:"2px solid #FFB627"}}><div style={styles.cardHead}><div><div style={styles.cardLabel}>ALPACA PAPER · {account.account_number}{mode==="alpaca"?<span style={{color:"#FFB627",marginLeft:10}}>· ORDERS LIVE</span>:<span style={{color:"#5a5a5a",marginLeft:10}}>· read-only</span>}</div><div style={styles.cardBigNum}>${fmt(equity,2)} <span style={{...styles.delta,color:dayPnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(dayPnlPct)} today</span></div></div><div style={{display:"grid",gridTemplateColumns:"repeat(4,auto)",gap:16}}><Diag label="BUYING POWER" value={`$${fmt(bp,0)}`}/><Diag label="CASH" value={`$${fmt(Number(account.cash),0)}`}/><Diag label="POSITIONS" value={positions.length}/><Diag label="STATUS" value={account.status}/></div></div>{errors.length>0&&<div style={{marginTop:12}}><div style={styles.cardLabel}>API ERRORS</div><div style={{maxHeight:60,overflow:"auto",fontSize:10,color:"#FF7A7A"}}>{errors.slice(0,3).map((e,i)=><div key={i}><span style={{color:"#5a5a5a"}}>{shortTime(new Date(e.t).toISOString())}</span> {e.msg}</div>)}</div></div>}</section>;
 }
 
-function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount,activesLastScan}){
+function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount,activesLastScan,anthropicKey,onAnthropicKeyChange}){
   const set=(k,v)=>onChange({...settings,[k]:v});
   const[wlDraft,setWlDraft]=useState(settings.watchlist.join(", "));
   useEffect(()=>{setWlDraft(settings.watchlist.join(", "));},[settings.watchlist]);
@@ -682,6 +684,12 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
         </div>
         {settings.scanMode==="watchlist"&&<label style={{display:"flex",flexDirection:"column",gap:3}}><div style={styles.fieldLabel}>SYMBOLS</div><input type="text" value={wlDraft} onChange={e=>setWlDraft(e.target.value.toUpperCase())} onBlur={commitWl} onKeyDown={e=>{if(e.key==="Enter")e.currentTarget.blur();}} style={{...styles.input,textTransform:"uppercase"}} placeholder="AAPL, TSLA, NVDA..."/><div style={{fontSize:9,color:"#3a3a3a",marginTop:2}}>any US equity symbol</div></label>}
         {settings.scanMode==="actives"&&<div><NumField label="TOP N" value={settings.mostActivesCount} min={5} max={50} step={5} onChange={v=>set("mostActivesCount",v)} help="top volume stocks"/><div style={{marginTop:8,fontSize:10,color:"#5a5a5a"}}>last scan: {activesLastScan?shortTime(activesLastScan):"not yet"}</div>{connStatus.state!=="connected"&&<div style={{...styles.alpacaWarn,marginTop:8}}>⚠ connect Alpaca to enable</div>}</div>}
+      </div>
+      <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
+        <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>ANTHROPIC API KEY — BTC AI ANALYSIS</div>
+        <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ stored in memory only · never shared · get yours at console.anthropic.com</div>
+        <SecretField label="ANTHROPIC API KEY" value={anthropicKey} placeholder="sk-ant-api03-…" onChange={onAnthropicKeyChange} mask/>
+        {anthropicKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {anthropicKey.slice(0,12)}…</div>}
       </div>
       <div style={{...styles.settingGroup,borderColor:"#FFB627",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#FFB627"}}>ALPACA PAPER ACCOUNT</div>
