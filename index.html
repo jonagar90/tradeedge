@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = {
   gapMinPct:10, priceMin:1, priceMax:20,
   scanIntervalMs:60000, pollMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
   gapMomentumEnabled:true, continuationEnabled:false,
+  preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
   contRsiMin:55, contRsiMax:80, contRvolMin:2, contMinMove:3, contTpPct:3, contSlPct:1.5,
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
@@ -89,6 +90,20 @@ function calcRSI(prices){
   return 100-(100/(1+(g/n)/Math.max(l/n,0.0001)));
 }
 
+function checkPreMarketEntry(ticker,s){
+  const d=getMkt(ticker);
+  const {isPreMarket,h}=getEST();
+  if(!isPreMarket)return{pass:false,reason:"Not pre-market"};
+  if(h<4)return{pass:false,reason:"Before 4am EST"};
+  if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price ${d.price.toFixed(2)} outside range`};
+  if(d.gapPct<s.gapMinPct)return{pass:false,reason:`Gap ${d.gapPct.toFixed(1)}% < ${s.gapMinPct}%`};
+  if(d.rvol>0&&d.rvol<2)return{pass:false,reason:`RVOL ${d.rvol.toFixed(1)}x < 2x`};
+  const rsi=calcRSI(d.priceHistory);
+  if(rsi<50)return{pass:false,reason:`RSI ${rsi.toFixed(0)} < 50 (weak momentum)`};
+  if(d.preMarketHigh>0&&d.price<d.preMarketHigh*0.98)return{pass:false,reason:`Price not near pre-market high`};
+  return{pass:true,rsi,rvol:d.rvol,gapPct:d.gapPct,vwap:d.vwap};
+}
+
 function checkGapEntry(ticker,s){
   const d=getMkt(ticker);
   const {minsFromOpen,isMarketOpen,isPreMarket}=getEST();
@@ -96,7 +111,7 @@ function checkGapEntry(ticker,s){
   if(isPreMarket){
     if(d.price>=s.priceMin&&d.price<=s.priceMax&&d.gapPct>=s.gapMinPct)
       return{pass:false,reason:`Pre-market radar ${d.gapPct.toFixed(1)}% gap`,preMarket:true};
-    return{pass:false,reason:"Pre-market"};
+    return{pass:false,reason:"Pre-market — enable Pre-Market mode to trade"};
   }
   if(!isMarketOpen)return{pass:false,reason:"Market closed"};
   if(minsFromOpen>60)return{pass:false,reason:"After 10:30am window"};
@@ -173,7 +188,68 @@ const alpaca={
   placeOrder:({symbol,notional,side},c)=>aPost("/v2/orders",{symbol,notional:notional.toFixed(2),side,type:"market",time_in_force:"day"},c),
 };
 
-/* ---- Claude BTC AI ---- */
+/* ---- Yahoo Finance gap scanner ---- */
+async function fetchYahooGappers(minGapPct=5, minPrice=0.5, maxPrice=50){
+  try{
+    // Yahoo Finance most active + day gainers screener
+    const urls=[
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50",
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50",
+    ];
+    const results={};
+    for(const url of urls){
+      try{
+        const r=await fetch(url,{headers:{"Accept":"application/json"}});
+        if(!r.ok)continue;
+        const j=await r.json();
+        const quotes=j?.finance?.result?.[0]?.quotes||[];
+        for(const q of quotes){
+          if(!q.symbol||results[q.symbol])continue;
+          const price=q.regularMarketPrice||q.preMarketPrice||0;
+          const prevClose=q.regularMarketPreviousClose||0;
+          const changeP=q.regularMarketChangePercent||q.preMarketChangePercent||0;
+          const volume=q.regularMarketVolume||q.preMarketVolume||0;
+          if(price<minPrice||price>maxPrice)continue;
+          if(changeP<minGapPct)continue;
+          results[q.symbol]={
+            symbol:q.symbol, price, prevClose,
+            changeP, volume,
+            marketCap:q.marketCap||0,
+            name:q.shortName||q.symbol,
+          };
+        }
+      }catch(e){}
+    }
+    return Object.values(results);
+  }catch(e){return[];}
+}
+
+async function fetchYahooQuotes(symbols){
+  if(!symbols.length)return{};
+  try{
+    const chunks=[];
+    for(let i=0;i<symbols.length;i+=20)chunks.push(symbols.slice(i,i+20));
+    const result={};
+    for(const chunk of chunks){
+      try{
+        const r=await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${chunk.join(",")}&fields=regularMarketPrice,regularMarketVolume,regularMarketChangePercent,regularMarketPreviousClose,preMarketPrice,preMarketChangePercent,preMarketVolume,regularMarketOpen`);
+        if(!r.ok)continue;
+        const j=await r.json();
+        const quotes=j?.quoteResponse?.result||[];
+        for(const q of quotes){
+          if(q.symbol)result[q.symbol]={
+            price:q.preMarketPrice||q.regularMarketPrice||0,
+            prevClose:q.regularMarketPreviousClose||0,
+            open:q.regularMarketOpen||0,
+            volume:q.preMarketVolume||q.regularMarketVolume||0,
+            changeP:q.preMarketChangePercent||q.regularMarketChangePercent||0,
+          };
+        }
+      }catch(e){}
+    }
+    return result;
+  }catch(e){return{};}
+}
 async function analyzeBTC(price,series,rsi,vwap,key){
   const prices=series.slice(-20).map(p=>p.p);
   const high=Math.max(...prices),low=Math.min(...prices);
@@ -379,7 +455,11 @@ function App(){
   const [alpacaAccount,setAlpacaAccount]=useState(null);
   const [alpacaPositions,setAlpacaPositions]=useState([]);
   const [alpacaErrors,setAlpacaErrors]=useState([]);
-  const [scanTickers,setScanTickers]=useState([]);
+  const [yahooTickers,setYahooTickers]=useState([]);
+  const [yahooLastScan,setYahooLastScan]=useState(null);
+  const [yahooErrors,setYahooErrors]=useState(0);
+  const yahooTickersRef=useRef([]);
+  useEffect(()=>{yahooTickersRef.current=yahooTickers;},[yahooTickers]);
   const [tickerData,setTickerData]=useState({});
   const [lastScan,setLastScan]=useState(null);
   const [wsStatus,setWsStatus]=useState("off");
@@ -460,6 +540,54 @@ function App(){
     };
     scan();const id=setInterval(scan,settings.scanIntervalMs);return()=>{cancelled=true;clearInterval(id);};
   },[connStatus.state,settings.scanIntervalMs]);
+
+  /* Yahoo Finance gap scanner — runs every 2 minutes, finds gappers by % change */
+  useEffect(()=>{
+    let cancelled=false;
+    const scan=async()=>{
+      try{
+        const s=settingsRef.current;
+        const gappers=await fetchYahooGappers(s.gapMinPct,s.priceMin,s.priceMax);
+        if(cancelled||!gappers.length)return;
+        const syms=gappers.map(g=>g.symbol).filter(s=>s&&s.length<=6);
+        // Get fresh quotes for all found tickers
+        const quotes=await fetchYahooQuotes(syms);
+        if(cancelled)return;
+        const newRadar=[];
+        for(const sym of syms){
+          const q=quotes[sym]||{};
+          const price=q.price||gappers.find(g=>g.symbol===sym)?.price||0;
+          const prevClose=q.prevClose||gappers.find(g=>g.symbol===sym)?.prevClose||0;
+          const volume=q.volume||0;
+          const changeP=q.changeP||gappers.find(g=>g.symbol===sym)?.changeP||0;
+          if(!price)continue;
+          // Seed market data
+          updateMkt(sym,price,volume,prevClose,q.open||0);
+          priceRef.current[sym]=price;
+          // Add to radar if gapping enough
+          if(changeP>=s.gapMinPct)
+            newRadar.push({ticker:sym,price,gapPct:changeP,volume,rvol:getMkt(sym).rvol,prevClose,source:"Yahoo"});
+          // Add to scan tickers if not already there
+          setScanTickers(prev=>{
+            if(prev.includes(sym))return prev;
+            return [...prev,sym];
+          });
+          setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),price}}));
+        }
+        if(newRadar.length){
+          setRadar(prev=>{
+            const existing=prev.filter(r=>!newRadar.find(n=>n.ticker===r.ticker));
+            return[...newRadar,...existing].sort((a,b)=>b.gapPct-a.gapPct).slice(0,30);
+          });
+        }
+        setYahooTickers(syms);
+        setYahooLastScan(new Date().toISOString());
+      }catch(e){setYahooErrors(n=>n+1);}
+    };
+    scan();
+    const id=setInterval(scan,120000); // every 2 minutes
+    return()=>{cancelled=true;clearInterval(id);};
+  },[settings.gapMinPct,settings.priceMin,settings.priceMax]);
 
   /* WebSocket real-time price stream */
   useEffect(()=>{
@@ -563,31 +691,58 @@ function App(){
       const balance=tradesRef.current.balance;
       const s=settingsRef.current;
       const{minsFromOpen}=getEST();
-      for(const ticker of scanTickersRef.current){
+      const allTickers=[...new Set([...scanTickersRef.current,...yahooTickersRef.current])];
+      for(const ticker of allTickers){
         if(open.has(ticker))continue;
         let check=null,strategy=null;
-        if(s.gapMomentumEnabled&&minsFromOpen>=0&&minsFromOpen<=60){
+
+        // Pre-market strategy (4am-9:30am)
+        if(s.preMarketEnabled&&isPreMarket){
+          const c=checkPreMarketEntry(ticker,s);
+          if(c.pass){check=c;strategy="PRE";}
+          else setScanLog(p=>[{t:nowIso(),ticker,reason:`[PRE] ${c.reason}`},...p.slice(0,49)]);
+        }
+
+        // Gap momentum (9:30-10:30am)
+        if(!check&&s.gapMomentumEnabled&&minsFromOpen>=0&&minsFromOpen<=60){
           const c=checkGapEntry(ticker,s);
           if(c.pass){check=c;strategy="GAP";}
           else if(!c.preMarket)setScanLog(p=>[{t:nowIso(),ticker,reason:`[GAP] ${c.reason}`},...p.slice(0,49)]);
         }
+
+        // Continuation (9:30am-3:30pm)
         if(!check&&s.continuationEnabled&&minsFromOpen>=1&&minsFromOpen<=360){
           const c=checkContEntry(ticker,s);
           if(c.pass){check=c;strategy="CONT";}
           else setScanLog(p=>[{t:nowIso(),ticker,reason:`[CONT] ${c.reason}`},...p.slice(0,49)]);
         }
+
         if(!check)continue;
         const d=getMkt(ticker);const px=d.price;if(!px)continue;
-        const tpPct=strategy==="GAP"?s.tpPct1:s.contTpPct;
-        const slPct=strategy==="GAP"?s.slPct:s.contSlPct;
+
+        // Pre-market uses wider TP/SL and whole share qty (Alpaca requirement)
+        const tpPct=strategy==="PRE"?s.preMarketTpPct:strategy==="GAP"?s.tpPct1:s.contTpPct;
+        const slPct=strategy==="PRE"?s.preMarketSlPct:strategy==="GAP"?s.slPct:s.contSlPct;
         const sl=strategy==="GAP"?Math.max(d.firstCandleLow||px*(1-slPct/100),px*(1-slPct/100)):px*(1-slPct/100);
         const tp=px*(1+tpPct/100);
         const size=Math.min(s.maxTradeSize,balance*0.02);
+
         setSignals(prev=>[{id:`${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,tpPct,slPct,size,rvol:d.rvol,gapPct:d.gapPct,rsi:calcRSI(d.priceHistory),vwap:d.vwap,strategy,rr:((tp-px)/(px-sl)),createdAt:nowIso()},...prev].slice(0,50));
+
         let alpacaOrderId=null;
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-          try{const order=await alpaca.placeOrder({symbol:ticker,notional:size,side:"buy"},credsRef.current);alpacaOrderId=order.id;}
-          catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);continue;}
+          try{
+            // Pre-market: use qty-based order (whole shares), not notional
+            let orderBody;
+            if(strategy==="PRE"){
+              const qty=Math.max(1,Math.floor(size/px));
+              orderBody={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day",extended_hours:true};
+            } else {
+              orderBody={symbol:ticker,notional:size.toFixed(2),side:"buy",type:"market",time_in_force:"day"};
+            }
+            const order=await aPost("/v2/orders",orderBody,credsRef.current);
+            alpacaOrderId=order.id;
+          }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);continue;}
         }
         dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct,tpPct,size,vwap:d.vwap,rvol:d.rvol,gapPct:d.gapPct,strategy,openedAt:nowIso(),openPrice:px,alpacaOrderId}});
         open.add(ticker);
@@ -627,6 +782,7 @@ function App(){
         <div style={S.headerRight}>
           {circuitBreaker&&<div style={{...S.pill,borderColor:"#FF7A7A",color:"#FF7A7A"}}><span style={{...S.pillDot,background:"#FF7A7A"}}/>🚨 CIRCUIT BREAKER</div>}
           <div style={{...S.pill,borderColor:"#5a5a5a",color:"#5a5a5a"}}>EST {String(estNow.h).padStart(2,"0")}:{String(estNow.m).padStart(2,"0")} {estNow.isPreMarket?"PRE-MKT":estNow.isMarketOpen?"OPEN":"CLOSED"}</div>
+          {settings.preMarketEnabled&&<div style={{...S.pill,borderColor:"#a78bfa",color:"#a78bfa",fontSize:9}}>PRE-MKT</div>}
           {settings.gapMomentumEnabled&&<div style={{...S.pill,borderColor:"#7CFFB2",color:"#7CFFB2",fontSize:9}}>GAP</div>}
           {settings.continuationEnabled&&<div style={{...S.pill,borderColor:"#FFB627",color:"#FFB627",fontSize:9}}>CONT</div>}
           {connStatus.state==="connected"&&<div style={{...S.pill,borderColor:wsColor,color:wsColor,fontSize:9}}><span style={{width:5,height:5,borderRadius:"50%",background:wsColor,display:"inline-block",marginRight:4,animation:wsStatus==="live"?"pulse 1.5s infinite":"none"}}/>{wsStatus==="live"?"WS LIVE":wsStatus.toUpperCase()}</div>}
@@ -709,7 +865,7 @@ function App(){
                 <div style={{fontWeight:700,fontSize:12,color:"#7CFFB2"}}>{r.ticker}</div>
                 <div style={{fontSize:15,marginTop:4}}>${fmt(r.price,2)}</div>
                 <div style={{fontSize:11,color:"#7CFFB2",marginTop:2}}>GAP {fmtPct(r.gapPct)}</div>
-                <div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>RVOL {r.rvol>0?r.rvol.toFixed(1)+"x":"—"} · prev ${fmt(r.prevClose,2)}</div>
+                <div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>RVOL {r.rvol>0?r.rvol.toFixed(1)+"x":"—"} · prev ${fmt(r.prevClose,2)} {r.source==="Yahoo"?<span style={{color:"#FFB627"}}>· YF</span>:""}</div>
               </div>
             ))}
           </div>
@@ -718,10 +874,12 @@ function App(){
 
       <section style={S.card}>
         <div style={S.cardLabel}>
-          MOMENTUM SCANNER — {scanTickers.length} SYMBOLS · {lastScan?shortTime(lastScan):"—"}
+          MOMENTUM SCANNER — {[...new Set([...scanTickers,...yahooTickers])].length} SYMBOLS
+          <span style={{color:"#7CFFB2",marginLeft:8}}>Alpaca {lastScan?shortTime(lastScan):"—"}</span>
+          <span style={{color:"#FFB627",marginLeft:8}}>Yahoo {yahooLastScan?shortTime(yahooLastScan):"—"} {yahooErrors>0?`(${yahooErrors} err)`:""}</span>
           {connStatus.state==="connected"?<span style={{color:wsColor,marginLeft:8}}>{wsStatus==="live"?"● WS LIVE":"● "+wsStatus}</span>:<span style={{color:"#5a5a5a",marginLeft:8}}>connect Alpaca</span>}
         </div>
-        {!scanTickers.length?<div style={S.empty}>Connect Alpaca to start scanning</div>:(
+        {![...new Set([...scanTickers,...yahooTickers])].length?<div style={S.empty}>Scanning for gappers via Yahoo Finance + Alpaca…</div>:(
           <div style={{overflowX:"auto"}}>
             <table style={S.table}>
               <thead><tr>
@@ -730,7 +888,7 @@ function App(){
                 <th style={S.thR}>1ST CANDLE</th><th style={S.th}>STATUS</th>
               </tr></thead>
               <tbody>
-                {scanTickers.map(ticker=>{
+                {[...new Set([...scanTickers,...yahooTickers])].map(ticker=>{
                   const d=tickerData[ticker]||getMkt(ticker);
                   const rsi=calcRSI(d.priceHistory||[]);
                   const gapC=checkGapEntry(ticker,settings);
@@ -847,16 +1005,27 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
       </div>
       <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>STRATEGY MODES</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+          <button onClick={()=>set("preMarketEnabled",!settings.preMarketEnabled)} style={{...styles.modeBtn,...(settings.preMarketEnabled?{background:"#1a0e3a",borderColor:"#a78bfa",color:"#a78bfa"}:{})}}>
+            PRE-MARKET<div style={styles.modeBtnSub}>4am–9:30am · gap + volume</div>
+            <div style={{marginTop:6,fontSize:9,color:settings.preMarketEnabled?"#a78bfa":"#5a5a5a"}}>{settings.preMarketEnabled?"● ENABLED":"○ DISABLED"}</div>
+          </button>
           <button onClick={()=>set("gapMomentumEnabled",!settings.gapMomentumEnabled)} style={{...styles.modeBtn,...(settings.gapMomentumEnabled?styles.modeBtnActive:{})}}>
-            GAP MOMENTUM<div style={styles.modeBtnSub}>9:30–10:30am · gap 10%+ breakout</div>
+            GAP MOMENTUM<div style={styles.modeBtnSub}>9:30–10:30am · breakout</div>
             <div style={{marginTop:6,fontSize:9,color:settings.gapMomentumEnabled?"#7CFFB2":"#5a5a5a"}}>{settings.gapMomentumEnabled?"● ENABLED":"○ DISABLED"}</div>
           </button>
           <button onClick={()=>set("continuationEnabled",!settings.continuationEnabled)} style={{...styles.modeBtn,...(settings.continuationEnabled?styles.modeBtnActiveAlpaca:{})}}>
-            CONTINUATION<div style={styles.modeBtnSub}>9:30am–3:30pm · all-day momentum</div>
+            CONTINUATION<div style={styles.modeBtnSub}>9:30am–3:30pm · all-day</div>
             <div style={{marginTop:6,fontSize:9,color:settings.continuationEnabled?"#FFB627":"#5a5a5a"}}>{settings.continuationEnabled?"● ENABLED":"○ DISABLED"}</div>
           </button>
         </div>
+        {settings.preMarketEnabled&&(
+          <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <NumField label="PRE-MKT TP %" value={settings.preMarketTpPct} min={2} max={30} step={0.5} onChange={v=>set("preMarketTpPct",v)} help="wider — pre-market moves fast"/>
+            <NumField label="PRE-MKT SL %" value={settings.preMarketSlPct} min={1} max={15} step={0.5} onChange={v=>set("preMarketSlPct",v)} help="wider — pre-market is volatile"/>
+            <div style={{...styles.alpacaWarn,gridColumn:"1/-1"}}>⚠ Pre-market uses whole share qty orders (Alpaca requirement) · extended_hours:true · IEX data may be thin before 7am</div>
+          </div>
+        )}
         {settings.continuationEnabled&&(
           <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
             <NumField label="MIN MOVE %" value={settings.contMinMove} min={1} max={20} step={0.5} onChange={v=>set("contMinMove",v)} help="must be up X% from open"/>
