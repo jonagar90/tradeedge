@@ -144,7 +144,10 @@ async function fetchYahooQuotes(symbols){
   return result;
 }
 
-/* ---- Entry logic ---- */
+/* ---- per-ticker exit confirmation counters ---- */
+const exitCounters={};
+const getCounter=t=>{if(!exitCounters[t])exitCounters[t]={vwapBelow:0,rvolLow:0};return exitCounters[t];};
+const resetCounter=t=>{exitCounters[t]={vwapBelow:0,rvolLow:0};};
 function checkPreMarketEntry(ticker,s){
   const d=getMkt(ticker);
   const{isPreMarket,h}=getEST();
@@ -625,14 +628,41 @@ function App(){
     for(const trade of open){
       if(trade.ticker==="BTC")continue;
       const d=getMkt(trade.ticker);const px=priceRef.current[trade.ticker];if(!px)continue;
+
+      // Minimum hold time — don't exit within first 60 seconds
+      const holdMs=now-new Date(trade.openedAt).getTime();
+      if(holdMs<60000)continue;
+
+      const counter=getCounter(trade.ticker);
       let hit=null;
-      if(px>=trade.tp)hit="TP1";
-      else if(px<=trade.sl)hit="SL";
-      else if(d.rvol>0&&d.rvol<s.rvolExit)hit="RVOL_FADE";
+
+      // Hard TP — exit immediately, no confirmation needed
+      if(px>=trade.tp){hit="TP1";resetCounter(trade.ticker);}
+
+      // Hard SL — exit immediately
+      else if(px<=trade.sl){hit="SL";resetCounter(trade.ticker);}
+
+      // VWAP stop — require 3 consecutive ticks below VWAP
+      else if(d.vwap>0&&px<d.vwap){
+        counter.vwapBelow++;
+        counter.rvolLow=0; // reset other counter
+        if(counter.vwapBelow>=3){hit="VWAP";resetCounter(trade.ticker);}
+      }
+
+      // RVOL fade — require 5 consecutive ticks below exit threshold
+      else if(d.rvol>0&&d.rvol<s.rvolExit){
+        counter.rvolLow++;
+        counter.vwapBelow=0; // reset other counter
+        if(counter.rvolLow>=5){hit="RVOL_FADE";resetCounter(trade.ticker);}
+      }
+
+      // Price recovered — reset counters
+      else{resetCounter(trade.ticker);}
+
       if(hit){
         const closePrice=hit==="TP1"?trade.tp:px;
         if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
-        if(hit==="SL"||hit==="RVOL_FADE"){const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);setDailyLoss(d=>{const nl=d+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});}
+        if(hit==="SL"||hit==="VWAP"||hit==="RVOL_FADE"){const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);setDailyLoss(d=>{const nl=d+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});}
         dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now,tolerance:tol});
       }
     }
@@ -704,6 +734,7 @@ function App(){
 
   const manualClose=(trade)=>{
     const px=priceRef.current[trade.ticker]??trade.entry;
+    resetCounter(trade.ticker);
     if(modeRef.current==="alpaca"&&connStatus.state==="connected"&&trade.ticker!=="BTC")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
     dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now(),tolerance:settingsRef.current.assertTolerancePct});
   };
@@ -883,9 +914,11 @@ function App(){
           <div style={S.cardLabel}>OPEN POSITIONS ({trades.openTrades.filter(t=>t.ticker!=="BTC").length})</div>
           {!trades.openTrades.filter(t=>t.ticker!=="BTC").length?<div style={S.empty}>{running?"scanning…":"press START"}</div>:(
             <table style={S.table}>
-              <thead><tr><th style={S.th}>SYM</th><th style={S.th}>MODE</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP</th><th style={S.thR}>SL</th><th style={S.thR}>RVOL</th><th style={S.thR}>UPL</th><th style={S.th}></th></tr></thead>
+              <thead><tr><th style={S.th}>SYM</th><th style={S.th}>MODE</th><th style={S.thR}>ENTRY</th><th style={S.thR}>NOW</th><th style={S.thR}>TP</th><th style={S.thR}>SL</th><th style={S.thR}>RVOL</th><th style={S.thR}>HOLD</th><th style={S.thR}>UPL</th><th style={S.th}></th></tr></thead>
               <tbody>{trades.openTrades.filter(t=>t.ticker!=="BTC").map(o=>{
                 const px=priceRef.current[o.ticker]??o.entry,upl=((px-o.entry)/o.entry)*100,d=getMkt(o.ticker);
+                const holdSec=Math.floor((Date.now()-new Date(o.openedAt).getTime())/1000);
+                const isLocked=holdSec<60;
                 const modeColor=o.strategy==="PRE"?"#a78bfa":o.strategy==="GAP"?"#7CFFB2":"#FFB627";
                 return(<tr key={o.id}>
                   <td style={S.td}>{o.ticker}</td>
@@ -894,6 +927,7 @@ function App(){
                   <td style={{...S.tdR,color:"#7CFFB2"}}>${fmt(o.tp,2)}</td>
                   <td style={{...S.tdR,color:"#FF7A7A"}}>${fmt(o.sl,2)}</td>
                   <td style={{...S.tdR,color:d.rvol>0&&d.rvol<settings.rvolExit?"#FF7A7A":"#7CFFB2"}}>{d.rvol>0?`${d.rvol.toFixed(1)}x`:"—"}</td>
+                  <td style={{...S.tdR,color:isLocked?"#FFB627":"#5a5a5a"}}>{isLocked?`🔒${holdSec}s`:`${holdSec}s`}</td>
                   <td style={{...S.tdR,color:upl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(upl)}</td>
                   <td style={S.td}><button onClick={()=>manualClose(o)} style={S.closeBtn}>CLOSE</button></td>
                 </tr>);
