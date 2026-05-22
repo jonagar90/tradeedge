@@ -19,6 +19,7 @@ body{background:#060606;color:#e8e8e8;font-family:'JetBrains Mono',ui-monospace,
 table{border-collapse:collapse;width:100%;}
 input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none;}
 input[type=number]{-moz-appearance:textfield;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}
 </style>
 </head>
 <body>
@@ -30,25 +31,13 @@ const {LineChart,Line,XAxis,YAxis,Tooltip,ResponsiveContainer,ReferenceLine,Area
 const PROXY = "https://alpaca-proxy.jonagar90.workers.dev";
 
 const DEFAULT_SETTINGS = {
-  startingBalance: 10000,
-  maxTradeSize: 100,
-  dailyLossLimit: 200,
-  tpPct1: 5, tpPct2: 10, slPct: 3,
-  rsiMin: 60, rsiMax: 80,
-  rvolEntry: 5, rvolExit: 3,
-  gapMinPct: 10,
-  priceMin: 1, priceMax: 20,
-  scanIntervalMs: 60000,
-  pollMs: 15000,
-  mostActivesCount: 30,
-  assertTolerancePct: 0.5,
-  gapMomentumEnabled: true,
-  continuationEnabled: false,
-  contRsiMin: 55, contRsiMax: 80,
-  contRvolMin: 2,
-  contMinMove: 3,
-  contTpPct: 3,
-  contSlPct: 1.5,
+  startingBalance:10000, maxTradeSize:100, dailyLossLimit:200,
+  tpPct1:5, tpPct2:10, slPct:3,
+  rsiMin:60, rsiMax:80, rvolEntry:5, rvolExit:3,
+  gapMinPct:10, priceMin:1, priceMax:20,
+  scanIntervalMs:60000, pollMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
+  gapMomentumEnabled:true, continuationEnabled:false,
+  contRsiMin:55, contRsiMax:80, contRvolMin:2, contMinMove:3, contTpPct:3, contSlPct:1.5,
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -56,38 +45,42 @@ const fmt=(n,d=2)=>n===null||n===undefined||Number.isNaN(n)?"—":Number(n).toLo
 const fmtPct=(n,d=2)=>n===null||n===undefined?"—":`${n>=0?"+":""}${n.toFixed(d)}%`;
 const nowIso=()=>new Date().toISOString();
 const shortTime=iso=>iso?new Date(iso).toLocaleTimeString(undefined,{hour12:false}):"—";
-const randn=()=>{let u=0,v=0;while(u===0)u=Math.random();while(v===0)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
 
 const getEST=()=>{
-  const now=new Date();
-  const est=new Date(now.getTime()-(4*3600000));
+  const est=new Date(new Date().getTime()-(4*3600000));
   const h=est.getUTCHours(),m=est.getUTCMinutes();
   const minsFromOpen=(h-9)*60+(m-30);
   return{h,m,minsFromOpen,isPreMarket:h>=4&&minsFromOpen<0,isMarketOpen:minsFromOpen>=0&&minsFromOpen<=390};
 };
 
-// Per-ticker market data store
+/* ---- per-ticker market data ---- */
 const mktData={};
-const getMkt=(t)=>{
-  if(!mktData[t])mktData[t]={price:0,prevClose:0,open:0,preMarketHigh:0,volume:0,avgVolumeByMinute:{},priceHistory:[],vwapNum:0,vwapDen:0,vwap:0,firstCandleHigh:0,firstCandleLow:0,firstCandleClose:false,rvol:0,gapPct:0,lastUpdate:0};
+const getMkt=t=>{
+  if(!mktData[t])mktData[t]={price:0,prevClose:0,open:0,preMarketHigh:0,volume:0,avgVolByMinute:{},priceHistory:[],vwapNum:0,vwapDen:0,vwap:0,firstCandleHigh:0,firstCandleLow:0,firstCandleDone:false,rvol:0,gapPct:0};
   return mktData[t];
 };
-
-function updateMktData(ticker,price,volume,prevClose,open){
+function updateMkt(ticker,price,volume,prevClose,open){
   const d=getMkt(ticker);
   const {h,m,minsFromOpen}=getEST();
-  d.price=price; d.lastUpdate=Date.now();
+  d.price=price;
   if(prevClose>0)d.prevClose=prevClose;
   if(open>0)d.open=open;
   if(d.prevClose>0)d.gapPct=((d.open||price)-d.prevClose)/d.prevClose*100;
   if(minsFromOpen<0&&price>d.preMarketHigh)d.preMarketHigh=price;
   if(volume>0){d.vwapNum+=price*volume;d.vwapDen+=volume;d.vwap=d.vwapDen>0?d.vwapNum/d.vwapDen:price;d.volume+=volume;}
   if(minsFromOpen===0){if(price>d.firstCandleHigh)d.firstCandleHigh=price;if(d.firstCandleLow===0||price<d.firstCandleLow)d.firstCandleLow=price;}
-  if(minsFromOpen===1&&!d.firstCandleClose)d.firstCandleClose=true;
+  if(minsFromOpen===1&&!d.firstCandleDone)d.firstCandleDone=true;
   d.priceHistory.push(price);if(d.priceHistory.length>20)d.priceHistory.shift();
-  if(volume>0){const k=`${h}:${String(m).padStart(2,"0")}`;if(!d.avgVolumeByMinute[k])d.avgVolumeByMinute[k]=[];d.avgVolumeByMinute[k].push(volume);if(d.avgVolumeByMinute[k].length>20)d.avgVolumeByMinute[k].shift();const arr=d.avgVolumeByMinute[k];const avg=arr.reduce((a,b)=>a+b,0)/arr.length;d.rvol=avg>0?volume/avg:d.rvol;}
+  if(volume>0){
+    const k=`${h}:${String(m).padStart(2,"0")}`;
+    if(!d.avgVolByMinute[k])d.avgVolByMinute[k]=[];
+    d.avgVolByMinute[k].push(volume);
+    if(d.avgVolByMinute[k].length>20)d.avgVolByMinute[k].shift();
+    const arr=d.avgVolByMinute[k];
+    const avg=arr.reduce((a,b)=>a+b,0)/arr.length;
+    if(avg>0)d.rvol=volume/avg;
+  }
 }
-
 function calcRSI(prices){
   if(prices.length<2)return 50;
   let g=0,l=0;
@@ -102,14 +95,14 @@ function checkGapEntry(ticker,s){
   const rsi=calcRSI(d.priceHistory);
   if(isPreMarket){
     if(d.price>=s.priceMin&&d.price<=s.priceMax&&d.gapPct>=s.gapMinPct)
-      return{pass:false,reason:`Pre-market radar gap ${d.gapPct.toFixed(1)}%`,preMarket:true};
+      return{pass:false,reason:`Pre-market radar ${d.gapPct.toFixed(1)}% gap`,preMarket:true};
     return{pass:false,reason:"Pre-market"};
   }
   if(!isMarketOpen)return{pass:false,reason:"Market closed"};
-  if(minsFromOpen>60)return{pass:false,reason:"After 10:30am entry window"};
-  if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside $${s.priceMin}-$${s.priceMax}`};
+  if(minsFromOpen>60)return{pass:false,reason:"After 10:30am window"};
+  if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside range`};
   if(d.gapPct<s.gapMinPct)return{pass:false,reason:`Gap ${d.gapPct.toFixed(1)}% < ${s.gapMinPct}%`};
-  if(!d.firstCandleClose)return{pass:false,reason:"Waiting for first 1-min candle"};
+  if(!d.firstCandleDone)return{pass:false,reason:"Waiting for 1st candle"};
   if(d.price<=d.firstCandleHigh)return{pass:false,reason:`Below 1st candle high $${d.firstCandleHigh.toFixed(2)}`};
   if(d.rvol>0&&d.rvol<s.rvolEntry)return{pass:false,reason:`RVOL ${d.rvol.toFixed(1)}x < ${s.rvolEntry}x`};
   if(rsi<s.rsiMin||rsi>s.rsiMax)return{pass:false,reason:`RSI ${rsi.toFixed(0)} outside ${s.rsiMin}-${s.rsiMax}`};
@@ -128,20 +121,19 @@ function checkContEntry(ticker,s){
   if(!isMarketOpen)return{pass:false,reason:"Market closed"};
   if(minsFromOpen<1)return{pass:false,reason:"Waiting for open"};
   if(minsFromOpen>360)return{pass:false,reason:"After 3:30pm"};
-  if(!d.open||d.open<=0)return{pass:false,reason:"No open price"};
-  if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside range`};
+  if(!d.open)return{pass:false,reason:"No open price"};
+  if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price outside range`};
   const moveFromOpen=((d.price-d.open)/d.open)*100;
   if(moveFromOpen<s.contMinMove)return{pass:false,reason:`Move ${moveFromOpen.toFixed(1)}% < ${s.contMinMove}% from open`};
   if(d.rvol>0&&d.rvol<s.contRvolMin)return{pass:false,reason:`RVOL ${d.rvol.toFixed(1)}x < ${s.contRvolMin}x`};
   if(rsi<s.contRsiMin||rsi>s.contRsiMax)return{pass:false,reason:`RSI ${rsi.toFixed(0)} outside ${s.contRsiMin}-${s.contRsiMax}`};
-  if(d.vwap>0&&d.price<d.vwap)return{pass:false,reason:`Below VWAP $${d.vwap.toFixed(2)}`};
+  if(d.vwap>0&&d.price<d.vwap)return{pass:false,reason:`Below VWAP`};
   const recentHigh=d.priceHistory.length>0?Math.max(...d.priceHistory):d.price;
-  const pctFromHigh=((recentHigh-d.price)/recentHigh)*100;
-  if(pctFromHigh>2)return{pass:false,reason:`${pctFromHigh.toFixed(1)}% below recent high`};
-  return{pass:true,rsi,rvol:d.rvol,moveFromOpen,vwap:d.vwap,strategy:"CONT"};
+  if(((recentHigh-d.price)/recentHigh)*100>2)return{pass:false,reason:`More than 2% below recent high`};
+  return{pass:true,rsi,rvol:d.rvol,moveFromOpen,vwap:d.vwap};
 }
 
-// Alpaca helpers
+/* ---- Alpaca helpers ---- */
 const aH=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
 async function aGet(path,creds,data=false){
   const r=await fetch(`${data?`${PROXY}/data`:PROXY}${path}`,{headers:aH(creds)});
@@ -155,8 +147,9 @@ async function aPost(path,body,creds){
 }
 async function closeAlpacaPos(ticker,creds){
   for(let i=0;i<3;i++){
-    try{const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aH(creds)});if(r.ok||r.status===404)return true;await new Promise(res=>setTimeout(res,500));}
-    catch(e){await new Promise(res=>setTimeout(res,500));}
+    try{const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aH(creds)});if(r.ok||r.status===404)return true;}
+    catch(e){}
+    await new Promise(res=>setTimeout(res,500));
   }
   return false;
 }
@@ -177,19 +170,15 @@ const alpaca={
     }
     return result;
   },
-  getBars:async(sym,c,days=5)=>{
-    const end=new Date(),start=new Date(end.getTime()-days*24*3600000);
-    try{const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${start.toISOString().split("T")[0]}&limit=2000&feed=iex`,c,true);return r?.bars||[];}
-    catch(e){return[];}
-  },
   placeOrder:({symbol,notional,side},c)=>aPost("/v2/orders",{symbol,notional:notional.toFixed(2),side,type:"market",time_in_force:"day"},c),
 };
 
-async function analyzeBTC(btcPrice,btcSeries,rsi,vwap,key){
-  const prices=btcSeries.slice(-20).map(p=>p.p);
+/* ---- Claude BTC AI ---- */
+async function analyzeBTC(price,series,rsi,vwap,key){
+  const prices=series.slice(-20).map(p=>p.p);
   const high=Math.max(...prices),low=Math.min(...prices);
   const chg=prices.length>1?((prices[prices.length-1]-prices[0])/prices[0]*100).toFixed(2):0;
-  const prompt=`You are an elite Bitcoin scalper with 10+ years experience.\n\nBTC Data:\n- Price: $${btcPrice.toFixed(2)}\n- RSI: ${rsi.toFixed(1)}\n- VWAP: $${vwap?vwap.toFixed(2):"N/A"}\n- 1h High: $${high.toFixed(2)} Low: $${low.toFixed(2)}\n- 1h Change: ${chg}%\n- Recent: ${prices.map(p=>"$"+p.toFixed(0)).join(", ")}\n\nAnalyze using market structure, liquidity, order blocks, VWAP, RSI, EMA, S/R, smart money.\n\nRespond ONLY in this JSON, no markdown:\n{"bias":"BULLISH|BEARISH|NEUTRAL","structure":"one sentence","setup":{"direction":"LONG|SHORT|NO TRADE","entry":0,"stopLoss":0,"tp1":0,"tp2":0,"rr":"1:2","duration":"5-15 min"},"confidence":75,"confidenceReason":"one sentence","management":{"breakeven":0,"invalidation":"one sentence"},"warnings":"one sentence","verdict":"STRONG LONG|STRONG SHORT|WAIT|NO TRADE","leverage":"2x-3x","probability":72}`;
+  const prompt=`You are an elite Bitcoin scalper with 10+ years experience.\n\nBTC: $${price.toFixed(2)} RSI:${rsi.toFixed(1)} VWAP:${vwap?("$"+vwap.toFixed(2)):"N/A"} 1h-High:$${high.toFixed(2)} Low:$${low.toFixed(2)} Chg:${chg}%\nRecent:${prices.map(p=>"$"+p.toFixed(0)).join(",")}\n\nAnalyze: structure, liquidity, order blocks, VWAP, RSI, EMA, S/R, smart money.\n\nJSON only, no markdown:\n{"bias":"BULLISH|BEARISH|NEUTRAL","structure":"one sentence","setup":{"direction":"LONG|SHORT|NO TRADE","entry":0,"stopLoss":0,"tp1":0,"tp2":0,"rr":"1:2","duration":"5-15 min"},"confidence":75,"confidenceReason":"one sentence","management":{"breakeven":0,"invalidation":"one sentence"},"warnings":"one sentence","verdict":"STRONG LONG|STRONG SHORT|WAIT|NO TRADE","leverage":"2x-3x","probability":72}`;
   const resp=await fetch(`${PROXY}/v1/messages`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
   if(!resp.ok)throw new Error(`Claude API ${resp.status}`);
   const data=await resp.json();
@@ -197,6 +186,7 @@ async function analyzeBTC(btcPrice,btcSeries,rsi,vwap,key){
   return JSON.parse(text.replace(/```json|```/g,"").trim());
 }
 
+/* ---- Reducer ---- */
 const initialState={balance:STARTING_BALANCE,openTrades:[],closedTrades:[],equity:[{t:Date.now(),v:STARTING_BALANCE}]};
 function reducer(state,action){
   switch(action.type){
@@ -210,14 +200,14 @@ function reducer(state,action){
       const pnlPct=trade.direction==="LONG"?((closePrice-trade.entry)/trade.entry)*100:((trade.entry-closePrice)/trade.entry)*100;
       const pnl=(pnlPct/100)*trade.size;
       const assertion=reason==="TP1"||reason==="TP2"?{expected:`+${trade.tpPct.toFixed(2)}%`,actual:`${pnlPct.toFixed(2)}%`,pass:pnlPct>0}:reason==="SL"?{expected:`-${trade.slPct.toFixed(2)}%`,actual:`${pnlPct.toFixed(2)}%`,pass:Math.abs(pnlPct+trade.slPct)<tolerance+1}:{expected:"manual",actual:`${pnlPct.toFixed(2)}%`,pass:true};
-      const newBalance=state.balance+pnl;
-      return{...state,balance:newBalance,openTrades:state.openTrades.filter(o=>o.id!==tradeId),closedTrades:[{...trade,closedAt:nowIso(),closePrice,reason,pnl,pnlPct,holdMs:t-new Date(trade.openedAt).getTime(),assertion},...state.closedTrades],equity:[...state.equity,{t,v:newBalance}]};
+      return{...state,balance:state.balance+pnl,openTrades:state.openTrades.filter(o=>o.id!==tradeId),closedTrades:[{...trade,closedAt:nowIso(),closePrice,reason,pnl,pnlPct,holdMs:t-new Date(trade.openedAt).getTime(),assertion},...state.closedTrades],equity:[...state.equity,{t,v:state.balance+pnl}]};
     }
     case"RESET":return{...initialState,equity:[{t:Date.now(),v:STARTING_BALANCE}]};
     default:return state;
   }
 }
 
+/* ---- BTC Panel ---- */
 function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,tradeSize,setTradeSize,anthropicKey}){
   const [tab,setTab]=useState("manual");
   const [manDir,setManDir]=useState("LONG");
@@ -228,9 +218,8 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
   const [aiResult,setAiResult]=useState(null);
   const [aiError,setAiError]=useState(null);
   const [aiTime,setAiTime]=useState(null);
-  const btcOrb=getMkt("BTC");
-  const rsi=calcRSI(btcOrb.priceHistory);
-  const vwap=btcOrb.vwap;
+  const d=getMkt("BTC");
+  const rsi=calcRSI(d.priceHistory);
   const openBtc=trades.openTrades.filter(t=>t.ticker==="BTC");
 
   const manEntry=()=>{
@@ -240,7 +229,7 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
     const entry=btcPrice;
     const tp=manDir==="LONG"?entry*(1+tpPct/100):entry*(1-tpPct/100);
     const sl=manDir==="LONG"?entry*(1-slPct/100):entry*(1+slPct/100);
-    dispatch({type:"OPEN",trade:{id:`BTC-MAN-${Date.now()}`,ticker:"BTC",direction:manDir,entry,tp,sl,tpPct,slPct,size:tradeSize,vwap:vwap||entry,openedAt:nowIso(),openPrice:entry,manual:true}});
+    dispatch({type:"OPEN",trade:{id:`BTC-MAN-${Date.now()}`,ticker:"BTC",direction:manDir,entry,tp,sl,tpPct,slPct,size:tradeSize,vwap:d.vwap||entry,openedAt:nowIso(),openPrice:entry,manual:true}});
     setManMsg(`✓ ${manDir} $${tradeSize} @ $${entry.toFixed(2)}`);
     setTimeout(()=>setManMsg(""),3000);
   };
@@ -249,13 +238,13 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
     const dir=aiResult.setup.direction,entry=btcPrice;
     const tp=aiResult.setup.tp1||entry*(1+settingsRef.current.tpPct1/100);
     const sl=aiResult.setup.stopLoss||entry*(1-settingsRef.current.slPct/100);
-    dispatch({type:"OPEN",trade:{id:`BTC-AI-${Date.now()}`,ticker:"BTC",direction:dir,entry,tp,sl,tpPct:Math.abs((tp-entry)/entry*100),slPct:Math.abs((sl-entry)/entry*100),size:tradeSize,vwap:vwap||entry,openedAt:nowIso(),openPrice:entry,aiTrade:true}});
+    dispatch({type:"OPEN",trade:{id:`BTC-AI-${Date.now()}`,ticker:"BTC",direction:dir,entry,tp,sl,tpPct:Math.abs((tp-entry)/entry*100),slPct:Math.abs((sl-entry)/entry*100),size:tradeSize,vwap:d.vwap||entry,openedAt:nowIso(),openPrice:entry,aiTrade:true}});
   };
   const runAi=async()=>{
     if(!btcPrice){setAiError("No BTC price");return;}
     if(!anthropicKey){setAiError("Add Anthropic key in ⚙ Settings");return;}
     setAiLoading(true);setAiError(null);setAiResult(null);
-    try{const r=await analyzeBTC(btcPrice,btcSeries,rsi,vwap,anthropicKey);setAiResult(r);setAiTime(new Date().toLocaleTimeString());}
+    try{const r=await analyzeBTC(btcPrice,btcSeries,rsi,d.vwap,anthropicKey);setAiResult(r);setAiTime(new Date().toLocaleTimeString());}
     catch(e){setAiError(e.message||String(e));}
     finally{setAiLoading(false);}
   };
@@ -267,7 +256,7 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
         <div>
           <div style={S.cardLabel}>BTC TRADING PANEL</div>
-          <div style={{fontSize:20,fontWeight:500}}>${btcPrice?fmt(btcPrice,2):"—"} <span style={{fontSize:11,color:"#5a5a5a"}}>RSI {rsi.toFixed(0)} · VWAP {vwap?`$${fmt(vwap,2)}`:"—"} · {openBtc.length} open</span></div>
+          <div style={{fontSize:20,fontWeight:500}}>${btcPrice?fmt(btcPrice,2):"—"} <span style={{fontSize:11,color:"#5a5a5a"}}>RSI {rsi.toFixed(0)} · VWAP {d.vwap?`$${fmt(d.vwap,2)}`:"—"} · {openBtc.length} open</span></div>
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
           {[10,25,50,100].map(s=><button key={s} onClick={()=>setTradeSize(s)} style={{background:tradeSize===s?"#FFB627":"#060606",color:tradeSize===s?"#0d0d0d":"#e8e8e8",border:`1px solid ${tradeSize===s?"#FFB627":"#2a2a2a"}`,padding:"6px 10px",fontSize:11,fontFamily:"inherit",cursor:"pointer",borderRadius:2,fontWeight:tradeSize===s?700:400}}>${s}</button>)}
@@ -371,6 +360,7 @@ function BTCPanel({btcPrice,btcSeries,trades,dispatch,priceRef,settingsRef,trade
   );
 }
 
+/* ---- APP ---- */
 function App(){
   const [running,setRunning]=useState(false);
   const [settings,setSettings]=useState(DEFAULT_SETTINGS);
@@ -392,6 +382,7 @@ function App(){
   const [scanTickers,setScanTickers]=useState([]);
   const [tickerData,setTickerData]=useState({});
   const [lastScan,setLastScan]=useState(null);
+  const [wsStatus,setWsStatus]=useState("off");
   const [btcPrice,setBtcPrice]=useState(null);
   const [btcSeries,setBtcSeries]=useState([]);
   const [btcLastFetch,setBtcLastFetch]=useState(null);
@@ -408,8 +399,13 @@ function App(){
   const tradesRef=useRef(trades);useEffect(()=>{tradesRef.current=trades;},[trades]);
   const scanTickersRef=useRef(scanTickers);useEffect(()=>{scanTickersRef.current=scanTickers;},[scanTickers]);
 
-  useEffect(()=>{const id=setInterval(()=>{const{h,m}=getEST();if(h===9&&m===30){setDailyLoss(0);setCircuitBreaker(false);}},60000);return()=>clearInterval(id);},[]);
+  /* daily reset */
+  useEffect(()=>{
+    const id=setInterval(()=>{const{h,m}=getEST();if(h===9&&m===30){setDailyLoss(0);setCircuitBreaker(false);}},60000);
+    return()=>clearInterval(id);
+  },[]);
 
+  /* Alpaca connect */
   const testConnection=async()=>{
     if(!creds.keyId||!creds.secret){setConnStatus({state:"error",message:"paste API keys first"});return;}
     setConnStatus({state:"testing",message:"connecting…"});
@@ -420,10 +416,14 @@ function App(){
   useEffect(()=>{
     if(connStatus.state!=="connected")return;
     let cancelled=false;
-    const refresh=async()=>{try{const[acct,pos]=await Promise.all([alpaca.getAccount(credsRef.current),alpaca.getPositions(credsRef.current)]);if(cancelled)return;setAlpacaAccount(acct);setAlpacaPositions(pos);}catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`refresh: ${e.message||e}`},...p.slice(0,9)]);}};
+    const refresh=async()=>{
+      try{const[acct,pos]=await Promise.all([alpaca.getAccount(credsRef.current),alpaca.getPositions(credsRef.current)]);if(cancelled)return;setAlpacaAccount(acct);setAlpacaPositions(pos);}
+      catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`refresh: ${e.message||e}`},...p.slice(0,9)]);}
+    };
     refresh();const id=setInterval(refresh,10000);return()=>{cancelled=true;clearInterval(id);};
   },[connStatus.state]);
 
+  /* 60s full scan — refreshes ticker list + snapshot data */
   useEffect(()=>{
     if(connStatus.state!=="connected")return;
     let cancelled=false;
@@ -444,7 +444,7 @@ function App(){
           const volume=snap.minuteBar?.v||0;
           const vwap=snap.dailyBar?.vw||0;
           if(!price)continue;
-          updateMktData(sym,price,volume,prevClose,open);
+          updateMkt(sym,price,volume,prevClose,open);
           if(vwap>0)getMkt(sym).vwap=vwap;
           priceRef.current[sym]=price;
           const d=getMkt(sym);
@@ -461,44 +461,57 @@ function App(){
     scan();const id=setInterval(scan,settings.scanIntervalMs);return()=>{cancelled=true;clearInterval(id);};
   },[connStatus.state,settings.scanIntervalMs]);
 
-  // Fast price update loop — every 5s for all scan tickers
+  /* WebSocket real-time price stream */
   useEffect(()=>{
-    if(connStatus.state!=="connected")return;
-    let cancelled=false;
-    const pullPrices=async()=>{
-      const syms=scanTickersRef.current.slice(0,50);
-      if(!syms.length)return;
+    if(connStatus.state!=="connected"||!scanTickers.length)return;
+    let ws=null;
+    let reconnectTimer=null;
+
+    const connect=()=>{
+      setWsStatus("connecting");
       try{
-        const r=await aGet(`/v2/stocks/trades/latest?symbols=${syms.join(",")}&feed=iex`,credsRef.current,true);
-        if(cancelled)return;
-        const trades=r?.trades||{};
-        setTickerData(prev=>{
-          const next={...prev};
-          for(const sym of syms){
-            const p=trades[sym]?.p;
-            if(typeof p==="number"&&p>0){
-              const d=getMkt(sym);
-              updateMktData(sym,p,trades[sym]?.s||0);
-              priceRef.current[sym]=p;
-              next[sym]={...d,price:p};
+        ws=new WebSocket("wss://stream.data.alpaca.markets/v2/iex");
+        ws.onopen=()=>{
+          ws.send(JSON.stringify({action:"auth",key:credsRef.current.keyId,secret:credsRef.current.secret}));
+        };
+        ws.onmessage=(e)=>{
+          try{
+            const msgs=JSON.parse(e.data);
+            for(const msg of msgs){
+              if(msg.T==="success"&&msg.msg==="authenticated"){
+                setWsStatus("live");
+                ws.send(JSON.stringify({action:"subscribe",trades:scanTickersRef.current.slice(0,50)}));
+              }
+              if(msg.T==="t"&&msg.S&&msg.p){
+                const sym=msg.S,p=msg.p,v=msg.s||0;
+                updateMkt(sym,p,v);
+                priceRef.current[sym]=p;
+                setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),price:p}}));
+              }
             }
-          }
-          return next;
-        });
-      }catch(e){}
+          }catch(err){}
+        };
+        ws.onerror=()=>setWsStatus("error");
+        ws.onclose=()=>{setWsStatus("reconnecting");reconnectTimer=setTimeout(connect,2000);};
+      }catch(e){setWsStatus("error");reconnectTimer=setTimeout(connect,3000);}
     };
-    pullPrices();
-    const id=setInterval(pullPrices,5000);
-    return()=>{cancelled=true;clearInterval(id);};
+
+    connect();
+    return()=>{clearTimeout(reconnectTimer);try{if(ws)ws.close();}catch(e){}setWsStatus("off");};
   },[connStatus.state,scanTickers.length]);
-      {name:"Coinbase",if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.data?.amount);if(!p||isNaN(p))throw new Error("bad");return p;}},
+
+  /* BTC poll — Coinbase → CoinGecko → Binance */
+  useEffect(()=>{
+    let cancelled=false;
+    const providers=[
+      {name:"Coinbase",fetch:async()=>{const r=await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.data?.amount);if(!p||isNaN(p))throw new Error("bad");return p;}},
       {name:"CoinGecko",fetch:async()=>{const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=j?.bitcoin?.usd;if(!p)throw new Error("bad");return p;}},
       {name:"Binance",fetch:async()=>{const r=await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();const p=Number(j?.price);if(!p||isNaN(p))throw new Error("bad");return p;}},
     ];
     async function poll(){
       const errs=[];
       for(const prov of providers){
-        try{const p=await prov.fetch();if(cancelled)return;const t=Date.now();setBtcPrice(p);setBtcLastFetch(t);setBtcSource(prov.name);setBtcError(null);setBtcSeries(prev=>{const next=[...prev,{t,p}];return next.filter(x=>x.t>=t-3600000);});setBtcPolls(n=>n+1);priceRef.current["BTC"]=p;updateMktData("BTC",p,0);return;}
+        try{const p=await prov.fetch();if(cancelled)return;const t=Date.now();setBtcPrice(p);setBtcLastFetch(t);setBtcSource(prov.name);setBtcError(null);setBtcSeries(prev=>{const next=[...prev,{t,p}];return next.filter(x=>x.t>=t-3600000);});setBtcPolls(n=>n+1);priceRef.current["BTC"]=p;updateMkt("BTC",p,0);return;}
         catch(e){errs.push(`${prov.name}: ${e.message}`);}
       }
       if(!cancelled){setBtcError(errs.join(" · "));setBtcErrors(n=>n+1);setBtcSource(null);}
@@ -508,6 +521,7 @@ function App(){
 
   useEffect(()=>{const id=setInterval(()=>{if(btcLastFetch)setStale(Date.now()-btcLastFetch>settingsRef.current.pollMs*2);},2000);return()=>clearInterval(id);},[btcLastFetch]);
 
+  /* Exit check — fires on every tickerData update (WebSocket tick) */
   useEffect(()=>{
     const open=tradesRef.current.openTrades;if(!open.length)return;
     const now=Date.now(),tol=settingsRef.current.assertTolerancePct,s=settingsRef.current;
@@ -527,6 +541,7 @@ function App(){
     }
   },[tickerData]);
 
+  /* BTC exit check */
   useEffect(()=>{
     const open=tradesRef.current.openTrades.filter(t=>t.ticker==="BTC");if(!open.length)return;
     const now=Date.now(),tol=settingsRef.current.assertTolerancePct;
@@ -539,6 +554,7 @@ function App(){
     }
   },[btcPrice]);
 
+  /* Signal / entry loop */
   useEffect(()=>{
     if(!running)return;
     const fire=async()=>{
@@ -546,7 +562,7 @@ function App(){
       const open=new Set(tradesRef.current.openTrades.map(t=>t.ticker));
       const balance=tradesRef.current.balance;
       const s=settingsRef.current;
-      const {minsFromOpen}=getEST();
+      const{minsFromOpen}=getEST();
       for(const ticker of scanTickersRef.current){
         if(open.has(ticker))continue;
         let check=null,strategy=null;
@@ -602,6 +618,8 @@ function App(){
   const btcDelta=useMemo(()=>{if(btcSeries.length<2)return null;const f=btcSeries[0].p,l=btcSeries[btcSeries.length-1].p;return{abs:l-f,pct:((l-f)/f)*100};},[btcSeries]);
   const estNow=getEST();const S=styles;
 
+  const wsColor=wsStatus==="live"?"#7CFFB2":wsStatus==="connecting"||wsStatus==="reconnecting"?"#FFB627":"#FF7A7A";
+
   return(
     <div style={S.shell}>
       <header style={S.header}>
@@ -609,11 +627,9 @@ function App(){
         <div style={S.headerRight}>
           {circuitBreaker&&<div style={{...S.pill,borderColor:"#FF7A7A",color:"#FF7A7A"}}><span style={{...S.pillDot,background:"#FF7A7A"}}/>🚨 CIRCUIT BREAKER</div>}
           <div style={{...S.pill,borderColor:"#5a5a5a",color:"#5a5a5a"}}>EST {String(estNow.h).padStart(2,"0")}:{String(estNow.m).padStart(2,"0")} {estNow.isPreMarket?"PRE-MKT":estNow.isMarketOpen?"OPEN":"CLOSED"}</div>
-          <div style={{display:"flex",gap:4}}>
-            {settings.gapMomentumEnabled&&<div style={{...S.pill,borderColor:"#7CFFB2",color:"#7CFFB2",fontSize:9}}>GAP</div>}
-            {settings.continuationEnabled&&<div style={{...S.pill,borderColor:"#FFB627",color:"#FFB627",fontSize:9}}>CONT</div>}
-            {connStatus.state==="connected"&&<div style={{...S.pill,borderColor:wsStatus==="live"?"#7CFFB2":wsStatus==="connecting"||wsStatus==="reconnecting"?"#FFB627":"#FF7A7A",color:wsStatus==="live"?"#7CFFB2":wsStatus==="connecting"||wsStatus==="reconnecting"?"#FFB627":"#FF7A7A",fontSize:9}}><span style={{width:5,height:5,borderRadius:"50%",background:wsStatus==="live"?"#7CFFB2":wsStatus==="connecting"||wsStatus==="reconnecting"?"#FFB627":"#FF7A7A",animation:wsStatus==="live"?"pulse 1s infinite":"none"}}/>{wsStatus==="live"?"WS LIVE":wsStatus.toUpperCase()}</div>}
-          </div>
+          {settings.gapMomentumEnabled&&<div style={{...S.pill,borderColor:"#7CFFB2",color:"#7CFFB2",fontSize:9}}>GAP</div>}
+          {settings.continuationEnabled&&<div style={{...S.pill,borderColor:"#FFB627",color:"#FFB627",fontSize:9}}>CONT</div>}
+          {connStatus.state==="connected"&&<div style={{...S.pill,borderColor:wsColor,color:wsColor,fontSize:9}}><span style={{width:5,height:5,borderRadius:"50%",background:wsColor,display:"inline-block",marginRight:4,animation:wsStatus==="live"?"pulse 1.5s infinite":"none"}}/>{wsStatus==="live"?"WS LIVE":wsStatus.toUpperCase()}</div>}
           <AlpacaPill connStatus={connStatus} mode={execMode}/>
           <StatusPill running={running} stale={stale} btcError={btcError}/>
           <button onClick={()=>setRunning(r=>!r)} style={{...S.runBtn,...(running?S.runBtnStop:{})}}>{running?"■ STOP":"▶ START"}</button>
@@ -701,7 +717,10 @@ function App(){
       )}
 
       <section style={S.card}>
-        <div style={S.cardLabel}>MOMENTUM SCANNER — {scanTickers.length} SYMBOLS · last scan {lastScan?shortTime(lastScan):"—"} {connStatus.state==="connected"?"(IEX · live)":"(connect Alpaca)"}</div>
+        <div style={S.cardLabel}>
+          MOMENTUM SCANNER — {scanTickers.length} SYMBOLS · {lastScan?shortTime(lastScan):"—"}
+          {connStatus.state==="connected"?<span style={{color:wsColor,marginLeft:8}}>{wsStatus==="live"?"● WS LIVE":"● "+wsStatus}</span>:<span style={{color:"#5a5a5a",marginLeft:8}}>connect Alpaca</span>}
+        </div>
         {!scanTickers.length?<div style={S.empty}>Connect Alpaca to start scanning</div>:(
           <div style={{overflowX:"auto"}}>
             <table style={S.table}>
@@ -714,26 +733,24 @@ function App(){
                 {scanTickers.map(ticker=>{
                   const d=tickerData[ticker]||getMkt(ticker);
                   const rsi=calcRSI(d.priceHistory||[]);
-                  const gapCheck=checkGapEntry(ticker,settings);
-                  const contCheck=settings.continuationEnabled?checkContEntry(ticker,settings):null;
+                  const gapC=checkGapEntry(ticker,settings);
+                  const contC=settings.continuationEnabled?checkContEntry(ticker,settings):null;
                   const hasPos=trades.openTrades.find(o=>o.ticker===ticker);
-                  const isReady=gapCheck.pass||(contCheck&&contCheck.pass);
-                  const rvolColor=d.rvol>=settings.rvolEntry?"#7CFFB2":d.rvol>=3?"#FFB627":"#5a5a5a";
-                  const gapColor=d.gapPct>=settings.gapMinPct?"#7CFFB2":d.gapPct>0?"#FFB627":"#FF7A7A";
+                  const isReady=gapC.pass||(contC&&contC.pass);
                   return(
                     <tr key={ticker} style={{background:isReady?"#0a1a0a":hasPos?"#1a1a0a":"transparent"}}>
                       <td style={{...S.td,fontWeight:700,color:isReady?"#7CFFB2":hasPos?"#FFB627":"#e8e8e8"}}>{ticker}{hasPos?" 📌":""}</td>
                       <td style={S.tdR}>${fmt(d.price,2)}</td>
-                      <td style={{...S.tdR,color:gapColor}}>{d.gapPct?fmtPct(d.gapPct):"—"}</td>
-                      <td style={{...S.tdR,color:rvolColor}}>{d.rvol>0?`${d.rvol.toFixed(1)}x`:"—"}</td>
+                      <td style={{...S.tdR,color:d.gapPct>=settings.gapMinPct?"#7CFFB2":d.gapPct>0?"#FFB627":"#FF7A7A"}}>{d.gapPct?fmtPct(d.gapPct):"—"}</td>
+                      <td style={{...S.tdR,color:d.rvol>=settings.rvolEntry?"#7CFFB2":d.rvol>=3?"#FFB627":"#5a5a5a"}}>{d.rvol>0?`${d.rvol.toFixed(1)}x`:"—"}</td>
                       <td style={{...S.tdR,color:rsi>=settings.rsiMin&&rsi<=settings.rsiMax?"#7CFFB2":"#5a5a5a"}}>{rsi.toFixed(0)}</td>
                       <td style={{...S.tdR,color:d.price>d.vwap?"#7CFFB2":"#FF7A7A"}}>${d.vwap?fmt(d.vwap,2):"—"}</td>
                       <td style={{...S.tdR,color:"#5a5a5a"}}>{d.firstCandleHigh>0?`H:$${fmt(d.firstCandleHigh,2)}`:"—"}</td>
                       <td style={{...S.td,fontSize:9}}>
-                        {gapCheck.pass&&<span style={{color:"#7CFFB2"}}>✅ GAP READY</span>}
-                        {!gapCheck.pass&&contCheck?.pass&&<span style={{color:"#FFB627"}}>✅ CONT READY</span>}
-                        {!gapCheck.pass&&!contCheck?.pass&&gapCheck.preMarket&&<span style={{color:"#7CFFB2"}}>🌅 {d.gapPct.toFixed(1)}% gap</span>}
-                        {!gapCheck.pass&&!contCheck?.pass&&!gapCheck.preMarket&&<span style={{color:"#3a3a3a"}}>{gapCheck.reason}</span>}
+                        {gapC.pass&&<span style={{color:"#7CFFB2"}}>✅ GAP READY</span>}
+                        {!gapC.pass&&contC?.pass&&<span style={{color:"#FFB627"}}>✅ CONT READY</span>}
+                        {!gapC.pass&&!contC?.pass&&gapC.preMarket&&<span style={{color:"#7CFFB2"}}>🌅 {d.gapPct.toFixed(1)}% gap</span>}
+                        {!gapC.pass&&!contC?.pass&&!gapC.preMarket&&<span style={{color:"#3a3a3a"}}>{gapC.reason}</span>}
                       </td>
                     </tr>
                   );
@@ -805,7 +822,7 @@ function App(){
         </div>
       </section>
 
-      <footer style={S.footer}>gap {settings.gapMinPct}%+ · rvol {settings.rvolEntry}x+ · $1-${settings.priceMax} · tp1 +{settings.tpPct1}% tp2 +{settings.tpPct2}% sl -{settings.slPct}% · circuit breaker ${settings.dailyLossLimit} · {settings.gapMomentumEnabled?"GAP ON":"GAP OFF"} · {settings.continuationEnabled?"CONT ON":"CONT OFF"}</footer>
+      <footer style={S.footer}>gap {settings.gapMinPct}%+ · rvol {settings.rvolEntry}x+ · $1-${settings.priceMax} · tp1 +{settings.tpPct1}% tp2 +{settings.tpPct2}% sl -{settings.slPct}% · circuit breaker ${settings.dailyLossLimit} · {settings.gapMomentumEnabled?"GAP ON":"GAP OFF"} · {settings.continuationEnabled?"CONT ON":"CONT OFF"} · {wsStatus==="live"?"WS LIVE":"WS "+wsStatus}</footer>
     </div>
   );
 }
@@ -828,40 +845,35 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
         <div><div style={styles.cardLabel}>SETTINGS</div><div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>changes apply immediately</div></div>
         <div style={{display:"flex",gap:8}}><button onClick={onReset} style={styles.resetBtn}>RESTORE DEFAULTS</button><button onClick={onClose} style={styles.resetBtn}>CLOSE</button></div>
       </div>
-
       <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>STRATEGY MODES</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
           <button onClick={()=>set("gapMomentumEnabled",!settings.gapMomentumEnabled)} style={{...styles.modeBtn,...(settings.gapMomentumEnabled?styles.modeBtnActive:{})}}>
-            GAP MOMENTUM
-            <div style={styles.modeBtnSub}>9:30–10:30am · gap 10%+ breakout</div>
-            <div style={{marginTop:6,fontSize:9,color:settings.gapMomentumEnabled?"#7CFFB2":"#5a5a5a",letterSpacing:1}}>{settings.gapMomentumEnabled?"● ENABLED":"○ DISABLED"}</div>
+            GAP MOMENTUM<div style={styles.modeBtnSub}>9:30–10:30am · gap 10%+ breakout</div>
+            <div style={{marginTop:6,fontSize:9,color:settings.gapMomentumEnabled?"#7CFFB2":"#5a5a5a"}}>{settings.gapMomentumEnabled?"● ENABLED":"○ DISABLED"}</div>
           </button>
           <button onClick={()=>set("continuationEnabled",!settings.continuationEnabled)} style={{...styles.modeBtn,...(settings.continuationEnabled?styles.modeBtnActiveAlpaca:{})}}>
-            CONTINUATION
-            <div style={styles.modeBtnSub}>9:30am–3:30pm · all-day momentum</div>
-            <div style={{marginTop:6,fontSize:9,color:settings.continuationEnabled?"#FFB627":"#5a5a5a",letterSpacing:1}}>{settings.continuationEnabled?"● ENABLED":"○ DISABLED"}</div>
+            CONTINUATION<div style={styles.modeBtnSub}>9:30am–3:30pm · all-day momentum</div>
+            <div style={{marginTop:6,fontSize:9,color:settings.continuationEnabled?"#FFB627":"#5a5a5a"}}>{settings.continuationEnabled?"● ENABLED":"○ DISABLED"}</div>
           </button>
         </div>
         {settings.continuationEnabled&&(
           <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
-            <NumField label="MIN MOVE FROM OPEN %" value={settings.contMinMove} min={1} max={20} step={0.5} onChange={v=>set("contMinMove",v)} help="must be up X% from open"/>
+            <NumField label="MIN MOVE %" value={settings.contMinMove} min={1} max={20} step={0.5} onChange={v=>set("contMinMove",v)} help="must be up X% from open"/>
             <NumField label="MIN RVOL" value={settings.contRvolMin} min={1} max={10} step={0.5} onChange={v=>set("contRvolMin",v)}/>
             <NumField label="RSI MIN" value={settings.contRsiMin} min={40} max={70} step={1} onChange={v=>set("contRsiMin",v)}/>
             <NumField label="RSI MAX" value={settings.contRsiMax} min={60} max={95} step={1} onChange={v=>set("contRsiMax",v)}/>
-            <NumField label="TP %" value={settings.contTpPct} min={0.5} max={10} step={0.5} onChange={v=>set("contTpPct",v)} help="tighter for continuation"/>
-            <NumField label="SL %" value={settings.contSlPct} min={0.5} max={5} step={0.5} onChange={v=>set("contSlPct",v)} help="tighter for continuation"/>
+            <NumField label="TP %" value={settings.contTpPct} min={0.5} max={10} step={0.5} onChange={v=>set("contTpPct",v)}/>
+            <NumField label="SL %" value={settings.contSlPct} min={0.5} max={5} step={0.5} onChange={v=>set("contSlPct",v)}/>
           </div>
         )}
       </div>
-
       <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>ANTHROPIC API KEY — BTC AI</div>
         <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ memory only · console.anthropic.com</div>
         <SecretField label="ANTHROPIC API KEY" value={anthropicKey} placeholder="sk-ant-api03-…" onChange={onAnthropicKeyChange} mask/>
         {anthropicKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {anthropicKey.slice(0,16)}…</div>}
       </div>
-
       <div style={{...styles.settingGroup,borderColor:"#FFB627",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#FFB627"}}>ALPACA PAPER ACCOUNT</div>
         <div style={styles.alpacaWarn}>⚠ paper-trading keys only · never paste live keys here</div>
@@ -881,11 +893,10 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           </div>
         </div>}
       </div>
-
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(210px,1fr))",gap:14}}>
         <SettingGroup title="ENTRY FILTERS">
           <NumField label="MIN GAP %" value={settings.gapMinPct} min={5} max={50} step={1} onChange={v=>set("gapMinPct",v)} help="min gap from prev close"/>
-          <NumField label="MIN RVOL" value={settings.rvolEntry} min={1} max={20} step={0.5} onChange={v=>set("rvolEntry",v)} help="gap strategy RVOL"/>
+          <NumField label="MIN RVOL" value={settings.rvolEntry} min={1} max={20} step={0.5} onChange={v=>set("rvolEntry",v)}/>
           <NumField label="EXIT RVOL" value={settings.rvolExit} min={1} max={10} step={0.5} onChange={v=>set("rvolExit",v)} help="exit if RVOL drops below"/>
           <NumField label="RSI MIN" value={settings.rsiMin} min={30} max={70} step={1} onChange={v=>set("rsiMin",v)}/>
           <NumField label="RSI MAX" value={settings.rsiMax} min={50} max={95} step={1} onChange={v=>set("rsiMax",v)}/>
@@ -893,14 +904,14 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="PRICE MAX $" value={settings.priceMax} min={1} max={500} step={1} onChange={v=>set("priceMax",v)}/>
         </SettingGroup>
         <SettingGroup title="EXITS AND RISK">
-          <NumField label="TP1 %" value={settings.tpPct1} min={1} max={20} step={0.5} onChange={v=>set("tpPct1",v)} help="first take profit"/>
-          <NumField label="TP2 %" value={settings.tpPct2} min={2} max={50} step={1} onChange={v=>set("tpPct2",v)} help="second take profit"/>
+          <NumField label="TP1 %" value={settings.tpPct1} min={1} max={20} step={0.5} onChange={v=>set("tpPct1",v)}/>
+          <NumField label="TP2 %" value={settings.tpPct2} min={2} max={50} step={1} onChange={v=>set("tpPct2",v)}/>
           <NumField label="HARD STOP %" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)}/>
           <NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)}/>
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)} help="circuit breaker"/>
         </SettingGroup>
         <SettingGroup title="TIMING">
-          <NumField label="SCAN INTERVAL MS" value={settings.scanIntervalMs} min={10000} max={300000} step={5000} onChange={v=>set("scanIntervalMs",v)}/>
+          <NumField label="SCAN INTERVAL MS" value={settings.scanIntervalMs} min={10000} max={300000} step={5000} onChange={v=>set("scanIntervalMs",v)} help="full scan cadence"/>
           <NumField label="MOST ACTIVES COUNT" value={settings.mostActivesCount} min={10} max={50} step={5} onChange={v=>set("mostActivesCount",v)}/>
           <NumField label="BTC POLL MS" value={settings.pollMs} min={10000} max={120000} step={1000} onChange={v=>set("pollMs",v)}/>
         </SettingGroup>
