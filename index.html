@@ -473,8 +473,6 @@ function App(){
   const [signals,setSignals]=useState([]);
   const [scanLog,setScanLog]=useState([]);
   const [radar,setRadar]=useState([]);
-  const [trades,dispatch]=useReducer(reducer,initialState);
-  const [dailyLoss,setDailyLoss]=useState(0);
   const [circuitBreaker,setCircuitBreaker]=useState(false);
   const [regimeState,setRegimeState]=useState("UNKNOWN");
   const [creds,setCreds]=useState({keyId:"",secret:""});
