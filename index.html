@@ -371,6 +371,13 @@ const resetCounter=t=>{exitCounters[t]={vwapBelow:0,rvolLow:0,redCandles:0};};
 /* ================================================================
    PROPER RVOL — time-scaled vs 20-day avg daily volume
    ================================================================ */
+// Module-level errors queue — anyone can push, App drains it into alpacaErrors state
+const dataErrors=[];
+function reportDataError(msg){
+  dataErrors.unshift({t:Date.now(),msg:msg});
+  if(dataErrors.length>20)dataErrors.length=20;
+}
+
 // Cache: {TICKER: {avgVol: number, fetchedAt: timestamp, fetching: bool}}
 // Lives across scans, refreshes once per day per ticker.
 const avgVolCache={};
@@ -449,46 +456,6 @@ async function prewarmTicker(sym,creds){
 }
 
 /* ================================================================
-   YAHOO + ALPACA SCANNERS
-   ================================================================ */
-async function fetchYahooGappers(minGap,minPrice,maxPrice){
-  const results={};
-  const urls=["https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50","https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=50"];
-  for(const url of urls){
-    try{
-      const r=await fetch(url,{headers:{Accept:"application/json"}});
-      if(!r.ok)continue;
-      const j=await r.json();
-      const quotes=j?.finance?.result?.[0]?.quotes||[];
-      for(const q of quotes){
-        if(!q.symbol||results[q.symbol])continue;
-        const price=q.regularMarketPrice||q.preMarketPrice||0;
-        const changeP=q.regularMarketChangePercent||q.preMarketChangePercent||0;
-        if(price<minPrice||price>maxPrice||changeP<minGap)continue;
-        results[q.symbol]={symbol:q.symbol,price,prevClose:q.regularMarketPreviousClose||0,changeP,volume:q.regularMarketVolume||0};
-      }
-    }catch(e){}
-  }
-  return Object.values(results);
-}
-
-async function fetchYahooQuotes(symbols){
-  if(!symbols.length)return{};
-  const result={};
-  for(let i=0;i<symbols.length;i+=20){
-    try{
-      const r=await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols.slice(i,i+20).join(",")}&fields=regularMarketPrice,regularMarketVolume,regularMarketChangePercent,regularMarketPreviousClose,preMarketPrice,preMarketChangePercent,preMarketVolume,regularMarketOpen`);
-      if(!r.ok)continue;
-      const j=await r.json();
-      for(const q of j?.quoteResponse?.result||[]){
-        if(q.symbol)result[q.symbol]={price:q.preMarketPrice||q.regularMarketPrice||0,prevClose:q.regularMarketPreviousClose||0,open:q.regularMarketOpen||0,volume:q.preMarketVolume||q.regularMarketVolume||0,changeP:q.preMarketChangePercent||q.regularMarketChangePercent||0};
-      }
-    }catch(e){}
-  }
-  return result;
-}
-
-/* ================================================================
    ALPACA HELPERS
    ================================================================ */
 const aH=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
@@ -504,27 +471,34 @@ const alpaca={
   // Returns array of {v: volume, c: close} or empty array on failure.
   getDailyBars:async(sym,c,days=25)=>{
     try{
-      // Pull last 35 calendar days to ensure we get ~20-25 trading days
       const endDate=new Date();
       const startDate=new Date(Date.now()-35*86400000);
       const start=startDate.toISOString().split("T")[0];
       const end=endDate.toISOString().split("T")[0];
       const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=iex&adjustment=raw`,c,true);
-      return r?.bars||[];
-    }catch(e){return[];}
+      const bars=r?.bars||[];
+      if(!bars.length)reportDataError(`${sym}: dailyBars returned empty`);
+      return bars;
+    }catch(e){
+      reportDataError(`${sym}: dailyBars failed — ${e.message||e}`);
+      return[];
+    }
   },
   // Fetches recent 1-minute bars for prewarming RSI/EMA calculations.
-  // Returns array of {t,o,h,l,c,v} or empty array on failure.
   getRecentMinuteBars:async(sym,c,limit=30)=>{
     try{
-      // Pull last 4 hours of 1-min bars to ensure premarket + intraday coverage
       const endDate=new Date();
       const startDate=new Date(Date.now()-4*60*60*1000);
       const start=startDate.toISOString();
       const end=endDate.toISOString();
       const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=iex&adjustment=raw`,c,true);
-      return r?.bars||[];
-    }catch(e){return[];}
+      const bars=r?.bars||[];
+      if(!bars.length)reportDataError(`${sym}: minuteBars returned empty`);
+      return bars;
+    }catch(e){
+      reportDataError(`${sym}: minuteBars failed — ${e.message||e}`);
+      return[];
+    }
   },
 };
 
@@ -581,10 +555,8 @@ function App(){
   const [alpacaPositions,setAlpacaPositions]=useState([]);
   const [alpacaErrors,setAlpacaErrors]=useState([]);
   const [alpacaTickers,setAlpacaTickers]=useState([]);
-  const [yahooTickers,setYahooTickers]=useState([]);
   const [tickerData,setTickerData]=useState({});
   const [alpacaLastScan,setAlpacaLastScan]=useState(null);
-  const [yahooLastScan,setYahooLastScan]=useState(null);
   const [wsStatus,setWsStatus]=useState("off");
   const [trades,dispatch]=useReducer(reducer,initialState);
   const [dailyLoss,setDailyLoss]=useState(0);
@@ -599,9 +571,19 @@ function App(){
   const [focusedTicker,setFocusedTicker]=useState(null); // which ticker the hero chart shows
   const tradesRef=useRef(trades);useEffect(()=>{tradesRef.current=trades;},[trades]);
   const alpacaTickersRef=useRef(alpacaTickers);useEffect(()=>{alpacaTickersRef.current=alpacaTickers;},[alpacaTickers]);
-  const yahooTickersRef=useRef(yahooTickers);useEffect(()=>{yahooTickersRef.current=yahooTickers;},[yahooTickers]);
-  const allTickers=useMemo(()=>[...new Set([...alpacaTickers,...yahooTickers])],[alpacaTickers,yahooTickers]);
+  const allTickers=useMemo(()=>[...new Set(alpacaTickers)],[alpacaTickers]);
   const allTickersRef=useRef(allTickers);useEffect(()=>{allTickersRef.current=allTickers;},[allTickers]);
+
+  // Drain module-level dataErrors (from prewarm/avgVol bars failures) into the Alpaca Errors panel
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      if(dataErrors.length){
+        const drained=dataErrors.splice(0,dataErrors.length);
+        setAlpacaErrors(prev=>[...drained,...prev].slice(0,20));
+      }
+    },2000);
+    return()=>clearInterval(id);
+  },[]);
 
   // Regime polling
   useEffect(()=>{const id=setInterval(()=>setRegimeState(regime.current),5000);return()=>clearInterval(id);},[]);
@@ -668,8 +650,6 @@ function App(){
     setTickerData(prev=>{const next={...prev};for(const sym of syms)next[sym]={...getMkt(sym)};return next;});
   }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`scan: ${e.message||e}`},...p.slice(0,9)]);}};scan();const id=setInterval(scan,settings.scanIntervalMs);return()=>{cancelled=true;clearInterval(id);};},[connStatus.state,settings.scanIntervalMs]);
 
-  // Yahoo scan
-  useEffect(()=>{let cancelled=false;const scan=async()=>{try{const s=settingsRef.current;const gappers=await fetchYahooGappers(s.gapMinPct,s.priceMin,s.priceMax);if(cancelled||!gappers.length)return;const syms=gappers.map(g=>g.symbol).filter(s=>s&&s.length<=6);const quotes=await fetchYahooQuotes(syms);if(cancelled)return;const newRadar=[];const newSyms=[];for(const sym of syms){const q=quotes[sym]||{};const g=gappers.find(x=>x.symbol===sym)||{};const price=q.price||g.price||0;const prevClose=q.prevClose||g.prevClose||0;const volume=q.volume||g.volume||0;const changeP=q.changeP||g.changeP||0;if(!price)continue;updateMkt(sym,price,volume,prevClose,q.open||0);getMkt(sym).source="yahoo";scoreTickker(sym,s);priceRef.current[sym]=price;if(changeP>=s.gapMinPct)newRadar.push({ticker:sym,price,gapPct:changeP,volume,rvol:getMkt(sym).rvol,prevClose,score:getMkt(sym).score,source:"Yahoo"});newSyms.push(sym);}if(newRadar.length)setRadar(prev=>{const ex=prev.filter(r=>!newRadar.find(n=>n.ticker===r.ticker));return[...newRadar,...ex].sort((a,b)=>b.gapPct-a.gapPct).slice(0,30);});setYahooTickers(prev=>[...new Set([...prev,...newSyms])]);setYahooLastScan(new Date().toISOString());setTickerData(prev=>{const next={...prev};for(const sym of newSyms)next[sym]={...getMkt(sym)};return next;});}catch(e){}};scan();const id=setInterval(scan,120000);return()=>{cancelled=true;clearInterval(id);};},[settings.gapMinPct,settings.priceMin,settings.priceMax]);
 
   // WebSocket
   useEffect(()=>{if(connStatus.state!=="connected"||!allTickers.length)return;let ws=null,reconnectTimer=null;const connect=()=>{setWsStatus("connecting");try{ws=new WebSocket("wss://stream.data.alpaca.markets/v2/iex");ws.onopen=()=>ws.send(JSON.stringify({action:"auth",key:credsRef.current.keyId,secret:credsRef.current.secret}));ws.onmessage=(e)=>{try{const msgs=JSON.parse(e.data);for(const msg of msgs){if(msg.T==="success"&&msg.msg==="authenticated"){setWsStatus("live");ws.send(JSON.stringify({action:"subscribe",trades:allTickersRef.current.slice(0,100)}));}if(msg.T==="t"&&msg.S&&msg.p){const sym=msg.S,p=msg.p,v=msg.s||0,t=Date.now();updateMkt(sym,p,v);priceRef.current[sym]=p;setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),price:p}}));// only buffer series for tickers we have open positions on
@@ -853,7 +833,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           <StatusPill running={running} stale={stale}/>
           <button onClick={()=>setRunning(r=>!r)} style={{...S.runBtn,...(running?S.runBtnStop:{})}}>{running?"■ STOP":"▶ START"}</button>
           <button onClick={()=>setSettingsOpen(o=>!o)} style={{...S.resetBtn,...(settingsOpen?{borderColor:"#FFB627",color:"#FFB627"}:{})}}>⚙ SETTINGS</button>
-          <button onClick={()=>{dispatch({type:"RESET"});setSignals([]);setDailyLoss(0);setCircuitBreaker(false);setScanLog([]);setRadar([]);setYahooTickers([]);setAlpacaTickers([]);}} style={S.resetBtn}>RESET</button>
+          <button onClick={()=>{dispatch({type:"RESET"});setSignals([]);setDailyLoss(0);setCircuitBreaker(false);setScanLog([]);setRadar([]);setAlpacaTickers([]);}} style={S.resetBtn}>RESET</button>
         </div>
       </header>
 
@@ -933,7 +913,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                 </div>
                 <div style={{fontSize:15,marginTop:4}}>${fmt(r.price,2)}</div>
                 <div style={{fontSize:11,color:"#7CFFB2",marginTop:2}}>GAP {fmtPct(r.gapPct)}</div>
-                <div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>RVOL {r.rvol>0?r.rvol.toFixed(1)+"x":"—"} · {r.source==="Yahoo"?<span style={{color:"#FFB627"}}>YF</span>:"ALP"}</div>
+                <div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>RVOL {r.rvol>0?r.rvol.toFixed(1)+"x":"—"} · ALP</div>
               </div>
             ))}
           </div>
@@ -945,11 +925,10 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           <div style={S.cardLabel}>MOMENTUM SCANNER — {allTickers.length} SYMBOLS · min score {settings.minScore}</div>
           <div style={{display:"flex",gap:12,fontSize:9,color:"#5a5a5a"}}>
             <span>Alpaca: {alpacaLastScan?shortTime(alpacaLastScan):"—"}</span>
-            <span style={{color:"#FFB627"}}>Yahoo: {yahooLastScan?shortTime(yahooLastScan):"—"}</span>
             <span style={{color:wsColor}}>{wsStatus==="live"?"● WS LIVE":"● WS "+wsStatus}</span>
           </div>
         </div>
-        {!allTickers.length?<div style={S.empty}>Scanning via Yahoo Finance + Alpaca…</div>:(
+        {!allTickers.length?<div style={S.empty}>Scanning via Alpaca…</div>:(
           <div style={{overflowX:"auto"}}>
             <table style={S.table}>
               <thead><tr>
