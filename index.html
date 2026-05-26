@@ -51,6 +51,16 @@ const DEFAULT_SETTINGS = {
   ignitionMinGap:12,
   ignitionMinRvol:8,
   breakPreMarketHigh:true,
+  // --- Intraday Momentum (10:30am-3:00pm lane, different criteria) ---
+  intradayMomentumEnabled:true,
+  intradayMinRvol:6,
+  intradayMaxVwapExt:8,        // max % above VWAP (anti-chase)
+  intradayBreakoutPct:0.3,     // % above last-hour high to confirm breakout
+  intradayAvoidDeadZone:true,  // skip 11:30-1:30 unless RVOL is exceptional
+  intradayDeadZoneRvolOverride:15, // RVOL needed to trade during dead zone
+  // --- EOD force-close (capital protection) ---
+  eodCloseEnabled:true,
+  eodCloseMinsBeforeClose:30,  // close all positions 30 min before 4pm = 3:30pm
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -198,7 +208,8 @@ function updateMkt(ticker,price,volume,prevClose,open){
 function updateStateMachine(ticker,price,volume){
   const d=getMkt(ticker);
   const{minsFromOpen}=getEST();
-  if(minsFromOpen<0||minsFromOpen>360)return false;
+  // Only active during regular trading hours (full session, not just first 6 hours)
+  if(minsFromOpen<0||minsFromOpen>390)return false;
   const prevState=d.state;
 
   switch(d.state){
@@ -362,6 +373,47 @@ function checkEntry(ticker,s){
         vwap:d.vwap,
         ema9:d.ema9
       };
+    }
+  }
+
+  // === INTRADAY MOMENTUM EXCEPTION (10:30am-3:00pm lane) ===
+  // Catches midday breakouts that happen after the morning ignition window has closed.
+  // Different criteria: no gap (irrelevant by midday), uses last-hour high instead of premarket high,
+  // tighter VWAP-extension limit, and avoids the dead zone unless RVOL is exceptional.
+  const intradayWindowOpen=s.intradayMomentumEnabled&&minsFromOpen>(s.ignitionWindowMins||15)&&minsFromOpen<=330;
+  if(intradayWindowOpen){
+    // Dead zone check: 11:30am-1:30pm is statistically the worst window for momentum
+    const{h:hh,m:mm}=getEST();
+    const minOfDay=hh*60+mm;
+    const inDeadZone=minOfDay>=(11*60+30)&&minOfDay<=(13*60+30);
+    const deadZoneOK=!inDeadZone||!s.intradayAvoidDeadZone||d.rvol>=(s.intradayDeadZoneRvolOverride||15);
+    if(deadZoneOK){
+      // Compute last-hour high from candles1m (need at least 30 candles for this to be meaningful)
+      const recentCandles=(d.candles1m||[]).slice(-60);
+      const lastHourHigh=recentCandles.length>=30?Math.max(...recentCandles.map(c=>c.high)):0;
+      // VWAP extension (anti-chase)
+      const vwapExt=d.vwap>0?((d.price-d.vwap)/d.vwap)*100:0;
+      const isIntradayMomentum=
+        recentCandles.length>=30&&
+        lastHourHigh>0&&
+        d.price>lastHourHigh*(1+(s.intradayBreakoutPct||0.3)/100)&&  // breaking last-hour high
+        d.rvol>=(s.intradayMinRvol||6)&&                              // volume re-expansion
+        d.vwap>0&&d.price>d.vwap&&                                    // above VWAP (trending)
+        vwapExt<=(s.intradayMaxVwapExt||8)&&                          // not over-extended
+        d.ema9>0&&d.ema21>0&&d.ema9>d.ema21&&                         // EMA bullish
+        rsi>=55&&rsi<=78;                                             // RSI sweet spot
+      if(isIntradayMomentum){
+        return{
+          pass:true,
+          rsi,
+          rvol:d.rvol,
+          gapPct:d.gapPct,
+          strategy:"INTRADAY",
+          score:Math.max(d.score||0,72),
+          vwap:d.vwap,
+          ema9:d.ema9
+        };
+      }
     }
   }
 
@@ -717,10 +769,31 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
   useEffect(()=>{
     const open=tradesRef.current.openTrades;if(!open.length)return;
     const now=Date.now(),s=settingsRef.current;
+    const est=getEST();
+    // EOD force-close trigger: minutes-from-open >= (390 - eodCloseMinsBeforeClose)
+    // e.g. with eodCloseMinsBeforeClose=30, this fires at minute 360 = 3:30pm ET
+    const eodTriggerMins=390-(s.eodCloseMinsBeforeClose||30);
+    const isEodWindow=s.eodCloseEnabled&&est.isMarketOpen&&est.minsFromOpen>=eodTriggerMins;
     for(const trade of open){
       const d=getMkt(trade.ticker);const px=priceRef.current[trade.ticker];if(!px)continue;
       const holdMs=now-new Date(trade.openedAt).getTime();
-      if(holdMs<60000)continue; // min 60s hold
+      // EOD force-close — highest priority, overrides min-hold and everything else
+      if(isEodWindow){
+        const closePrice=px;
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed EOD close ${trade.ticker}`},...p.slice(0,9)]);});
+        const isLoss=closePrice<trade.entry;
+        if(isLoss){
+          const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
+          setDailyLoss(dl=>{const nl=dl+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
+          updateRegime("LOSS");setRegimeState(regime.current);
+        } else {
+          updateRegime("WIN");setRegimeState(regime.current);
+        }
+        resetCounter(trade.ticker);
+        dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:"EOD_CLOSE",t:now});
+        continue;
+      }
+      if(holdMs<60000)continue; // min 60s hold (skipped for EOD above)
       const counter=getCounter(trade.ticker);
       const uplPct=((px-trade.entry)/trade.entry)*100;
 
@@ -1013,6 +1086,8 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                         {check.pass?(
                           check.strategy==="IGNITION"
                             ?<span style={{color:"#FF6B35",fontWeight:700}}>🔥 IGNITION</span>
+                            :check.strategy==="INTRADAY"
+                            ?<span style={{color:"#FFD23F",fontWeight:700}}>⚡ INTRADAY</span>
                             :<span style={{color:"#7CFFB2"}}>✅ ENTRY READY</span>
                         ):<span style={{color:"#3a3a3a"}}>{check.reason}</span>}
                       </td>
@@ -1070,7 +1145,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
               <table style={S.table}>
                 <thead><tr><th style={S.th}>TIME</th><th style={S.th}>SYM</th><th style={S.thR}>SCORE</th><th style={S.thR}>ENTRY</th><th style={S.thR}>EXIT</th><th style={S.th}>RSN</th><th style={S.thR}>GAP</th><th style={S.thR}>RVOL</th><th style={S.thR}>PNL%</th><th style={S.thR}>PNL$</th><th style={S.thR}>HOLD</th></tr></thead>
                 <tbody>{trades.closedTrades.map(c=>{
-                  const rsnColor=c.reason==="TP_FINAL"||c.reason==="TP_PARTIAL"?"#7CFFB2":c.reason==="MANUAL"?"#FFB627":"#FF7A7A";
+                  const rsnColor=c.reason==="TP_FINAL"||c.reason==="TP_PARTIAL"?"#7CFFB2":c.reason==="MANUAL"||c.reason==="EOD_CLOSE"?"#FFB627":"#FF7A7A";
                   return(<tr key={c.id}>
                     <td style={S.td}>{shortTime(c.closedAt)}</td>
                     <td style={S.td}>{c.ticker}{c.aiTrade?" 🤖":""}</td>
@@ -1208,6 +1283,29 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
             <span style={styles.fieldLabel}>REQUIRE PREMARKET HIGH BREAK</span>
           </label>
           <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,lineHeight:1.4}}>Only fire ignition entries when price breaks above the premarket high by 0.5%.</div>
+        </SettingGroup>
+        <SettingGroup title="INTRADAY MOMENTUM">
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.intradayMomentumEnabled} onChange={e=>set("intradayMomentumEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>INTRADAY ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Midday lane (10:30am-3:00pm). Catches breakouts after the ignition window closes. Uses last-hour high instead of premarket high.</div>
+          <NumField label="MIN RVOL" value={settings.intradayMinRvol} min={2} max={30} step={1} onChange={v=>set("intradayMinRvol",v)} help="minimum relative volume"/>
+          <NumField label="MAX VWAP EXTENSION %" value={settings.intradayMaxVwapExt} min={2} max={20} step={1} onChange={v=>set("intradayMaxVwapExt",v)} help="anti-chase — reject if price >N% above VWAP"/>
+          <NumField label="BREAKOUT % ABOVE LAST-HOUR HIGH" value={settings.intradayBreakoutPct} min={0.1} max={2} step={0.1} onChange={v=>set("intradayBreakoutPct",v)} help="breakout confirmation buffer"/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.intradayAvoidDeadZone} onChange={e=>set("intradayAvoidDeadZone",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>AVOID DEAD ZONE (11:30-1:30)</span>
+          </label>
+          <NumField label="DEAD ZONE RVOL OVERRIDE" value={settings.intradayDeadZoneRvolOverride} min={5} max={50} step={1} onChange={v=>set("intradayDeadZoneRvolOverride",v)} help="RVOL needed to trade during dead zone anyway"/>
+        </SettingGroup>
+        <SettingGroup title="EOD FORCE-CLOSE">
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.eodCloseEnabled} onChange={e=>set("eodCloseEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>EOD CLOSE ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Force-close all open positions N minutes before market close. Prevents overnight gap risk.</div>
+          <NumField label="MINUTES BEFORE 4PM CLOSE" value={settings.eodCloseMinsBeforeClose} min={5} max={60} step={5} onChange={v=>set("eodCloseMinsBeforeClose",v)} help="default 30 = 3:30pm close"/>
         </SettingGroup>
       </div>
     </section>
