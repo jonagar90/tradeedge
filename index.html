@@ -40,7 +40,7 @@ const DEFAULT_SETTINGS = {
   gapMinPct:10, priceMin:0.1, priceMax:50,
   minScore:70,        // minimum ticker score to trade
   maxOpenTrades:3,    // max 3 concurrent trades
-  scanIntervalMs:60000, mostActivesCount:30, assertTolerancePct:0.5,
+  scanIntervalMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
   gapMomentumEnabled:true, continuationEnabled:false,
   preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
   cooldownMs:1800000, // 30 min cooldown after SL
@@ -95,7 +95,7 @@ const mktData={};
 const getMkt=t=>{
   if(!mktData[t])mktData[t]={
     price:0,prevClose:0,open:0,preMarketHigh:0,
-    volume:0,avgVolByMinute:{},
+    volume:0,
     priceHistory:[],   // raw ticks
     candles1m:[],      // 1m OHLCV
     currentCandle:null,
@@ -414,6 +414,41 @@ async function getAvgDailyVol(sym,creds){
 }
 
 /* ================================================================
+   PREWARM — seed candle history + price history for new tickers
+   so RSI/EMA work immediately instead of waiting 14 minutes
+   ================================================================ */
+const prewarmCache={}; // {TICKER: {primedAt, fetching}}
+const PREWARM_TTL_MS=4*60*60*1000; // 4 hours
+
+async function prewarmTicker(sym,creds){
+  const cached=prewarmCache[sym];
+  if(cached?.fetching)return false;
+  if(cached&&Date.now()-cached.primedAt<PREWARM_TTL_MS)return false; // already primed recently
+  prewarmCache[sym]={primedAt:cached?.primedAt||0,fetching:true};
+  try{
+    const bars=await alpaca.getRecentMinuteBars(sym,creds,30);
+    if(!bars.length){prewarmCache[sym].fetching=false;return false;}
+    const d=getMkt(sym);
+    // Seed priceHistory with the closing prices of recent bars (used by EMA/RSI calcs)
+    // Only seed if we don't have meaningful history yet — don't overwrite live data
+    if(d.priceHistory.length<20){
+      const closes=bars.map(b=>b.c).filter(c=>c>0);
+      // Keep last 50 to leave room for live ticks
+      d.priceHistory=closes.slice(-50);
+    }
+    // Seed candles1m with recent bars
+    if(d.candles1m.length<10){
+      d.candles1m=bars.slice(-30).map(b=>({o:b.o,h:b.h,l:b.l,c:b.c,v:b.v||0,t:new Date(b.t).getTime()}));
+    }
+    prewarmCache[sym]={primedAt:Date.now(),fetching:false};
+    return true;
+  }catch(e){
+    prewarmCache[sym]={...prewarmCache[sym],fetching:false};
+    return false;
+  }
+}
+
+/* ================================================================
    YAHOO + ALPACA SCANNERS
    ================================================================ */
 async function fetchYahooGappers(minGap,minPrice,maxPrice){
@@ -475,6 +510,19 @@ const alpaca={
       const start=startDate.toISOString().split("T")[0];
       const end=endDate.toISOString().split("T")[0];
       const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=iex&adjustment=raw`,c,true);
+      return r?.bars||[];
+    }catch(e){return[];}
+  },
+  // Fetches recent 1-minute bars for prewarming RSI/EMA calculations.
+  // Returns array of {t,o,h,l,c,v} or empty array on failure.
+  getRecentMinuteBars:async(sym,c,limit=30)=>{
+    try{
+      // Pull last 4 hours of 1-min bars to ensure premarket + intraday coverage
+      const endDate=new Date();
+      const startDate=new Date(Date.now()-4*60*60*1000);
+      const start=startDate.toISOString();
+      const end=endDate.toISOString();
+      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=iex&adjustment=raw`,c,true);
       return r?.bars||[];
     }catch(e){return[];}
   },
@@ -575,13 +623,21 @@ function App(){
     const syms=actives.map(a=>a.symbol).filter(s=>s&&s.length<=5);
     const snaps=await alpaca.getSnapshots(syms,credsRef.current);
     if(cancelled)return;
-    // Kick off avg-vol fetches for any uncached tickers (fire-and-forget; cache populates for next scan)
+    // Identify tickers that need either avg-vol fetch or RSI/EMA prewarm
+    // Await both in parallel for new tickers so scoring works on the FIRST scan.
     const{minsFromOpen}=getEST();
+    const prewarmPromises=[];
     for(const sym of syms){
-      if(!avgVolCache[sym]||Date.now()-(avgVolCache[sym].fetchedAt||0)>CACHE_TTL_MS){
-        getAvgDailyVol(sym,credsRef.current); // async, no await
-      }
+      const needsAvgVol=!avgVolCache[sym]||Date.now()-(avgVolCache[sym].fetchedAt||0)>CACHE_TTL_MS;
+      const needsPrewarm=!prewarmCache[sym]||Date.now()-(prewarmCache[sym].primedAt||0)>PREWARM_TTL_MS;
+      if(needsAvgVol)prewarmPromises.push(getAvgDailyVol(sym,credsRef.current));
+      if(needsPrewarm)prewarmPromises.push(prewarmTicker(sym,credsRef.current));
     }
+    // Wait up to 3s for the parallel fetches to complete — bounded so a slow ticker doesn't stall the scan
+    if(prewarmPromises.length){
+      await Promise.race([Promise.all(prewarmPromises),new Promise(r=>setTimeout(r,3000))]);
+    }
+    if(cancelled)return;
     const s=settingsRef.current;const newRadar=[];
     for(const sym of syms){
       const snap=snaps[sym];if(!snap)continue;
