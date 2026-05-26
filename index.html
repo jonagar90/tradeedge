@@ -45,6 +45,12 @@ const DEFAULT_SETTINGS = {
   preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
   cooldownMs:1800000, // 30 min cooldown after SL
   riskPct:0.5,        // risk 0.5% per trade
+  // --- Momentum Ignition (aggressive open entry, first N minutes) ---
+  momentumIgnitionEnabled:true,
+  ignitionWindowMins:15,
+  ignitionMinGap:12,
+  ignitionMinRvol:8,
+  breakPreMarketHigh:true,
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -331,6 +337,33 @@ function checkEntry(ticker,s){
 
   // Gap requirement
   if(d.gapPct<s.gapMinPct)return{pass:false,reason:`Gap ${d.gapPct.toFixed(1)}% < ${s.gapMinPct}%`};
+
+  // === MOMENTUM IGNITION EXCEPTION (Aggressive Open Entry) ===
+  // Bypass the strict pullback-state requirement for high-conviction setups within the first N minutes.
+  // Designed to catch parabolic morning runners that never give a clean pullback.
+  const ignitionEnabled=s.momentumIgnitionEnabled&&minsFromOpen<=(s.ignitionWindowMins||15);
+  if(ignitionEnabled){
+    const pmHigh=d.preMarketHigh||d.open||0;
+    const isBreakingPMHigh=s.breakPreMarketHigh?(d.price>pmHigh*1.005):true;
+    const isIgnition=
+      d.gapPct>=(s.ignitionMinGap||12)&&
+      d.rvol>=(s.ignitionMinRvol||8)&&
+      isBreakingPMHigh&&
+      d.price>Math.max(d.vwap||0,d.ema9||0)*0.995&&
+      rsi>=52;
+    if(isIgnition){
+      return{
+        pass:true,
+        rsi,
+        rvol:d.rvol,
+        gapPct:d.gapPct,
+        strategy:"IGNITION",
+        score:Math.max(d.score||0,78),
+        vwap:d.vwap,
+        ema9:d.ema9
+      };
+    }
+  }
 
   // State machine — must be in CONFIRM state
   if(d.state!=="CONFIRM")return{pass:false,reason:`State: ${d.state} (need CONFIRM)`};
@@ -977,7 +1010,11 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                       <td style={{...S.tdR,color:d.ema9>d.ema21&&d.ema21>0?"#7CFFB2":"#5a5a5a"}}>{d.ema9?`$${fmt(d.ema9,2)}`:"—"}</td>
                       <td style={{...S.tdR,color:d.price>d.vwap?"#7CFFB2":"#5a5a5a"}}>{d.vwap?`$${fmt(d.vwap,2)}`:"—"}</td>
                       <td style={{...S.td,fontSize:9}}>
-                        {check.pass?<span style={{color:"#7CFFB2"}}>✅ ENTRY READY</span>:<span style={{color:"#3a3a3a"}}>{check.reason}</span>}
+                        {check.pass?(
+                          check.strategy==="IGNITION"
+                            ?<span style={{color:"#FF6B35",fontWeight:700}}>🔥 IGNITION</span>
+                            :<span style={{color:"#7CFFB2"}}>✅ ENTRY READY</span>
+                        ):<span style={{color:"#3a3a3a"}}>{check.reason}</span>}
                       </td>
                     </tr>
                   );
@@ -1156,6 +1193,21 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
         <SettingGroup title="TIMING">
           <NumField label="SCAN INTERVAL MS" value={settings.scanIntervalMs} min={10000} max={300000} step={5000} onChange={v=>set("scanIntervalMs",v)}/>
           <NumField label="MOST ACTIVES COUNT" value={settings.mostActivesCount} min={10} max={50} step={5} onChange={v=>set("mostActivesCount",v)}/>
+        </SettingGroup>
+        <SettingGroup title="MOMENTUM IGNITION">
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.momentumIgnitionEnabled} onChange={e=>set("momentumIgnitionEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>IGNITION ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Aggressive open-window entry: bypasses pullback/CONFIRM requirement for high-conviction setups in the first N minutes.</div>
+          <NumField label="IGNITION WINDOW (MIN FROM OPEN)" value={settings.ignitionWindowMins} min={5} max={60} step={1} onChange={v=>set("ignitionWindowMins",v)} help="how long after the open this lane is active"/>
+          <NumField label="MIN GAP %" value={settings.ignitionMinGap} min={5} max={50} step={1} onChange={v=>set("ignitionMinGap",v)} help="minimum gap to qualify as ignition"/>
+          <NumField label="MIN RVOL" value={settings.ignitionMinRvol} min={2} max={50} step={1} onChange={v=>set("ignitionMinRvol",v)} help="minimum relative volume"/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.breakPreMarketHigh} onChange={e=>set("breakPreMarketHigh",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>REQUIRE PREMARKET HIGH BREAK</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,lineHeight:1.4}}>Only fire ignition entries when price breaks above the premarket high by 0.5%.</div>
         </SettingGroup>
       </div>
     </section>
