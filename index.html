@@ -1045,6 +1045,15 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             <div style={{maxHeight:130,overflow:"auto"}}>{scanLog.map((s,i)=><div key={i} style={S.sigRow}><span style={{color:"#5a5a5a",minWidth:60}}>{shortTime(s.t)}</span><span style={{fontWeight:700,minWidth:50}}>{s.ticker}</span><span style={{fontSize:10,color:"#FF7A7A"}}>{s.reason}</span></div>)}</div>
           )}
         </div>
+        <div style={{...S.card,flex:1}}>
+          <div style={S.cardHead}>
+            <div style={S.cardLabel}>ALPACA ERRORS ({alpacaErrors.length})</div>
+            {alpacaErrors.length>0&&<button onClick={()=>setAlpacaErrors([])} style={{background:"transparent",border:"1px solid #2a2a2a",color:"#5a5a5a",fontSize:9,padding:"2px 8px",cursor:"pointer",fontFamily:"inherit"}}>CLEAR</button>}
+          </div>
+          {!alpacaErrors.length?<div style={S.empty}>no errors</div>:(
+            <div style={{maxHeight:130,overflow:"auto"}}>{alpacaErrors.map((e,i)=><div key={i} style={S.sigRow}><span style={{color:"#5a5a5a",minWidth:60}}>{shortTime(new Date(e.t).toISOString())}</span><span style={{fontSize:10,color:"#FF7A7A"}}>{e.msg}</span></div>)}</div>
+          )}
+        </div>
       </section>
 
       <footer style={S.footer}>selective momentum · max {settings.maxOpenTrades} trades · min score {settings.minScore}/100 · {settings.riskPct}% risk · partial +{settings.tpPartialPct}% → runner to +{settings.tpFinalPct}% · regime: {regimeState}</footer>
