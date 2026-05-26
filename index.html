@@ -485,15 +485,19 @@ const alpaca={
     }
   },
   // Fetches recent 1-minute bars for prewarming RSI/EMA calculations.
-  getRecentMinuteBars:async(sym,c,limit=30)=>{
+  // Uses a 48-hour window so we always capture yesterday's regular trading session
+  // (premarket-only windows return empty on the free IEX feed).
+  getRecentMinuteBars:async(sym,c,limit=50)=>{
     try{
       const endDate=new Date();
-      const startDate=new Date(Date.now()-4*60*60*1000);
+      const startDate=new Date(Date.now()-48*60*60*1000);
       const start=startDate.toISOString();
       const end=endDate.toISOString();
-      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=iex&adjustment=raw`,c,true);
-      const bars=r?.bars||[];
-      if(!bars.length)reportDataError(`${sym}: minuteBars returned empty`);
+      // limit=50 + sort=desc gets the 50 most recent bars (yesterday's last hour + today so far)
+      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=iex&adjustment=raw&sort=desc`,c,true);
+      // Reverse to chronological order so EMA/RSI calcs process them in order
+      const bars=(r?.bars||[]).slice().reverse();
+      if(!bars.length)reportDataError(`${sym}: minuteBars returned empty (48h window)`);
       return bars;
     }catch(e){
       reportDataError(`${sym}: minuteBars failed — ${e.message||e}`);
