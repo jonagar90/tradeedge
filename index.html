@@ -101,7 +101,11 @@ function updateRegime(result){
 function getRegimeMultiplier(){
   if(regime.current==="TRENDING")return 1.0;
   if(regime.current==="CHOPPY")return 0.5;
-  return 0; // NO_TRADE
+  if(regime.current==="NO_TRADE")return 0;
+  // Initial "UNKNOWN" state — before any wins/losses have occurred.
+  // Previously returned 0, which silently zeroed out position size and blocked all trades.
+  // Default to full size (1.0) until regime adjusts based on actual results.
+  return 1.0;
 }
 
 /* ================================================================
