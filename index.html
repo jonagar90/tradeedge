@@ -457,6 +457,155 @@ const getCounter=t=>{if(!exitCounters[t])exitCounters[t]={vwapBelow:0,rvolLow:0,
 const resetCounter=t=>{exitCounters[t]={vwapBelow:0,rvolLow:0,redCandles:0};};
 
 /* ================================================================
+   TRADE REPORT GENERATOR
+   Produces both human-readable text and structured JSON per closed trade.
+   Designed for evaluation by an AI analyst or experienced day trader.
+   ================================================================ */
+function buildTradeReport(trade,tradeIndex){
+  const ctx=trade.entryContext||{};
+  const isWin=trade.pnl>=0;
+  const holdSec=Math.floor((trade.holdMs||0)/1000);
+  const holdMin=Math.floor(holdSec/60);
+  const holdRemSec=holdSec%60;
+  const maxPx=trade.maxPrice||trade.closePrice;
+  const minPx=trade.minPrice||trade.closePrice;
+  const mfePct=((maxPx-trade.entry)/trade.entry)*100;
+  const maePct=((minPx-trade.entry)/trade.entry)*100;
+  const captureRatio=mfePct>0?((trade.pnlPct/mfePct)*100):0;
+  const openedDate=new Date(trade.openedAt);
+  const closedDate=new Date(trade.closedAt);
+  const openTime=openedDate.toLocaleString(undefined,{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+  const closeTime=closedDate.toLocaleString(undefined,{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+  const dateStr=openedDate.toLocaleString(undefined,{timeZone:"America/New_York",weekday:"short",month:"short",day:"2-digit"});
+
+  // Heuristic analysis — auto-flag patterns worth reviewing
+  const observations=[];
+  if(isWin&&trade.reason==="TP_FINAL")observations.push("✓ Hit full take-profit target — strong follow-through");
+  if(isWin&&trade.reason==="TP_PARTIAL")observations.push("✓ Captured partial profit; runner stalled before full TP");
+  if(trade.reason==="SL")observations.push("✗ Stopped out at hard SL — entry timing or thesis was wrong");
+  if(trade.reason==="VWAP_STOP")observations.push("✗ Lost VWAP — momentum failed, exit was protective");
+  if(trade.reason==="EMA9_TRAIL")observations.push("✓ Trailing stop on EMA9 protected partial gains");
+  if(trade.reason==="RVOL_FADE")observations.push("△ Volume dried up — exit avoided dead-money hold");
+  if(trade.reason==="EOD_CLOSE")observations.push("△ Force-closed at end of day — trade did not resolve naturally");
+  if(trade.reason==="MANUAL")observations.push("△ Manually closed by user");
+  if(mfePct>=1.5&&trade.pnlPct<0.3)observations.push(`? MFE was +${mfePct.toFixed(2)}% but exit was only ${trade.pnlPct.toFixed(2)}% — consider tighter trailing stop`);
+  if(maePct<=-1&&isWin)observations.push(`? MAE went to ${maePct.toFixed(2)}% before recovering — entry timing could be earlier`);
+  if(holdSec<120&&!isWin)observations.push("? Stopped out fast (<2min) — likely chasing or noise entry");
+  if(holdSec>1800&&trade.pnlPct<0.5&&trade.pnlPct>-0.5)observations.push("? Held >30min for negligible move — capital opportunity cost");
+  if(captureRatio>0&&captureRatio<25)observations.push(`? Only captured ${captureRatio.toFixed(0)}% of max favorable move`);
+  if(ctx.vwapExtPct>10)observations.push(`? Entered ${ctx.vwapExtPct.toFixed(1)}% above VWAP — extended/chasing entry`);
+  if(ctx.rsi&&ctx.rsi>75)observations.push(`? Entered at RSI ${ctx.rsi} — overextended momentum`);
+  if(ctx.openPositionsAtEntry>=2)observations.push(`△ ${ctx.openPositionsAtEntry} other positions open at entry — diversification risk`);
+
+  // Human-readable text format
+  const text=`═══════════════════════════════════════════════════════
+TRADE #${tradeIndex} — ${trade.ticker} — CLOSED ${closeTime} ET (${dateStr})
+═══════════════════════════════════════════════════════
+RESULT: ${isWin?"WIN":"LOSS"} ${fmtPct(trade.pnlPct)} (${trade.pnl>=0?"+":""}$${fmt(trade.pnl,2)})  |  Reason: ${trade.reason}
+
+ENTRY
+  Time: ${openTime} ET  |  Strategy: ${trade.strategy||"—"}
+  Price: $${fmt(trade.entry,2)}  |  Size: $${fmt(trade.size,2)}
+  SL: $${fmt(trade.sl,2)} (${(-trade.slPct).toFixed(1)}%)  |  TP: $${fmt(trade.tp,2)} (+${trade.tpPct}%)
+  Score: ${trade.score||"—"}/100
+
+EXIT
+  Time: ${closeTime} ET  |  Hold: ${holdMin}m ${holdRemSec}s
+  Price: $${fmt(trade.closePrice,2)}
+  P&L: ${trade.pnl>=0?"+":""}$${fmt(trade.pnl,2)} (${fmtPct(trade.pnlPct)})
+  Partial taken: ${trade.partialDone?"YES":"NO"}
+
+ENTRY CONDITIONS AT TRIGGER
+  RSI: ${ctx.rsi?ctx.rsi.toFixed(0):"—"}  |  RVOL: ${trade.rvol?trade.rvol.toFixed(1)+"x":"—"}
+  Gap: ${trade.gapPct?fmtPct(trade.gapPct):"—"}
+  VWAP: $${fmt(trade.vwap,2)}  |  Distance from VWAP: ${fmtPct(ctx.vwapExtPct||0)}
+  EMA9: $${fmt(trade.ema9,2)}  |  EMA21: $${fmt(ctx.ema21,2)}  |  EMA50: $${fmt(ctx.ema50,2)}
+  ATR: $${fmt(ctx.atr,3)}
+  Premarket High: $${fmt(ctx.preMarketHigh,2)}
+  State machine: ${ctx.state||"—"}
+
+PRICE PATH DURING HOLD
+  Entry: $${fmt(trade.entry,2)} → Peak: $${fmt(maxPx,2)} → Low: $${fmt(minPx,2)} → Exit: $${fmt(trade.closePrice,2)}
+  Max favorable excursion (MFE): ${fmtPct(mfePct)}
+  Max adverse excursion (MAE): ${fmtPct(maePct)}
+  Capture ratio: ${captureRatio>0?captureRatio.toFixed(0)+"%":"—"} of MFE
+
+MARKET CONTEXT
+  Mins from open: ${ctx.minsFromOpen!==undefined?ctx.minsFromOpen:"—"}  |  Session: ${ctx.sessionPosition||"—"}
+  Time of entry: ${ctx.estTime||"—"} ET
+  Day's regime at entry: ${ctx.regime||"—"}
+  Open positions at entry: ${ctx.openPositionsAtEntry!==undefined?ctx.openPositionsAtEntry:"—"}
+  Day volume: ${ctx.dayVolume?(ctx.dayVolume/1e6).toFixed(2)+"M":"—"}  |  20-day avg: ${ctx.avgDailyVol?(ctx.avgDailyVol/1e6).toFixed(2)+"M":"—"}
+
+OBSERVATIONS (auto-generated heuristics)
+${observations.length?observations.map(o=>"  "+o).join("\n"):"  (no notable patterns flagged)"}
+═══════════════════════════════════════════════════════`;
+
+  // Structured JSON for machine analysis / AI ingestion
+  const json={
+    tradeIndex,
+    ticker:trade.ticker,
+    direction:trade.direction,
+    strategy:trade.strategy,
+    score:trade.score,
+    result:isWin?"WIN":"LOSS",
+    pnl:Number(trade.pnl.toFixed(2)),
+    pnlPct:Number(trade.pnlPct.toFixed(3)),
+    reason:trade.reason,
+    entry:{
+      time:trade.openedAt,
+      timeET:openTime,
+      price:trade.entry,
+      size:trade.size,
+      sl:trade.sl,
+      tp:trade.tp,
+      slPct:trade.slPct,
+      tpPct:trade.tpPct,
+    },
+    exit:{
+      time:trade.closedAt,
+      timeET:closeTime,
+      price:trade.closePrice,
+      holdSeconds:holdSec,
+      partialTaken:!!trade.partialDone,
+    },
+    conditionsAtEntry:{
+      rsi:ctx.rsi,
+      rvol:trade.rvol,
+      gapPct:trade.gapPct,
+      vwap:trade.vwap,
+      vwapExtPct:Number((ctx.vwapExtPct||0).toFixed(2)),
+      ema9:trade.ema9,
+      ema21:ctx.ema21,
+      ema50:ctx.ema50,
+      atr:ctx.atr,
+      preMarketHigh:ctx.preMarketHigh,
+      stateMachine:ctx.state,
+    },
+    pricePath:{
+      entry:trade.entry,
+      peak:maxPx,
+      low:minPx,
+      exit:trade.closePrice,
+      mfePct:Number(mfePct.toFixed(3)),
+      maePct:Number(maePct.toFixed(3)),
+      captureRatioPct:Number(captureRatio.toFixed(1)),
+    },
+    marketContext:{
+      minsFromOpen:ctx.minsFromOpen,
+      sessionPosition:ctx.sessionPosition,
+      regime:ctx.regime,
+      openPositionsAtEntry:ctx.openPositionsAtEntry,
+      dayVolume:ctx.dayVolume,
+      avgDailyVol:ctx.avgDailyVol,
+    },
+    observations,
+  };
+
+  return{text,json};
+}
+
+/* ================================================================
    PROPER RVOL — time-scaled vs 20-day avg daily volume
    ================================================================ */
 // Module-level errors queue — anyone can push, App drains it into alpacaErrors state
@@ -666,6 +815,10 @@ function App(){
   // Live price-series buffer per ticker for charting open positions
   const [priceSeries,setPriceSeries]=useState({}); // {TICKER:[{t,p},...]}
   const [focusedTicker,setFocusedTicker]=useState(null); // which ticker the hero chart shows
+  // Trade Reports panel state
+  const [expandedReportId,setExpandedReportId]=useState(null);
+  const [reportCopiedAt,setReportCopiedAt]=useState(null);
+  const [lastCopiedId,setLastCopiedId]=useState(null);
   const tradesRef=useRef(trades);useEffect(()=>{tradesRef.current=trades;},[trades]);
   const alpacaTickersRef=useRef(alpacaTickers);useEffect(()=>{alpacaTickersRef.current=alpacaTickers;},[alpacaTickers]);
   const allTickers=useMemo(()=>[...new Set(alpacaTickers)],[alpacaTickers]);
@@ -794,6 +947,9 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         continue;
       }
       if(holdMs<60000)continue; // min 60s hold (skipped for EOD above)
+      // Update MFE/MAE — track peak and trough during the trade for reports
+      if(px>(trade.maxPrice||trade.entry))trade.maxPrice=px;
+      if(px<(trade.minPrice||trade.entry))trade.minPrice=px;
       const counter=getCounter(trade.ticker);
       const uplPct=((px-trade.entry)/trade.entry)*100;
 
@@ -903,7 +1059,30 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);continue;}
         }
 
-        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:s.slPct,tpPct:s.tpFinalPct,size,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId},maxOpen:s.maxOpenTrades});
+        const{minsFromOpen:openMins,h:eh,m:em}=getEST();
+        const sessionPosition=openMins<15?"OPEN_15M":openMins<60?"MORNING":openMins<210?"MIDDAY":openMins<360?"AFTERNOON":"LATE_AFTERNOON";
+        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:s.slPct,tpPct:s.tpFinalPct,size,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
+          // Rich context for trade reports
+          entryContext:{
+            rsi:check.rsi,
+            ema21:d.ema21,
+            ema50:d.ema50,
+            preMarketHigh:d.preMarketHigh||0,
+            vwapExtPct:d.vwap>0?((px-d.vwap)/d.vwap)*100:0,
+            atr:d.atr,
+            minsFromOpen:openMins,
+            sessionPosition,
+            estTime:`${String(eh).padStart(2,"0")}:${String(em).padStart(2,"0")}`,
+            regime:regime.current,
+            openPositionsAtEntry:tradesRef.current.openTrades.length,
+            avgDailyVol:d.avgDailyVol||0,
+            dayVolume:d.dayVolume||0,
+            state:d.state,
+          },
+          // MFE/MAE tracking — peak and trough during the trade
+          maxPrice:px,
+          minPrice:px,
+        },maxOpen:s.maxOpenTrades});
         open.add(ticker);
         // Reset state machine
         getMkt(ticker).state="IDLE";
@@ -1163,6 +1342,90 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             </div>
           )}
         </div>
+      </section>
+
+      <section style={S.card}>
+        <div style={S.cardHead}>
+          <div>
+            <div style={S.cardLabel}>TRADE REPORTS ({trades.closedTrades.length})</div>
+            <div style={{fontSize:10,color:"#5a5a5a",marginTop:2}}>structured analysis for AI review · expand a row for full report · copy/download for offline analysis</div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={()=>{
+              if(!trades.closedTrades.length)return;
+              const reports=trades.closedTrades.slice().reverse().map((c,i)=>buildTradeReport(c,trades.closedTrades.length-i).text).join("\n\n");
+              navigator.clipboard.writeText(reports).then(()=>{
+                setReportCopiedAt(Date.now());
+              }).catch(()=>{});
+            }} style={{background:"#0d0d0d",border:"1px solid #2a2a2a",color:"#e8e8e8",padding:"4px 10px",fontSize:10,cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+              {reportCopiedAt&&Date.now()-reportCopiedAt<2000?"✓ COPIED":"COPY ALL"}
+            </button>
+            <button onClick={()=>{
+              if(!trades.closedTrades.length)return;
+              const payload={
+                exportedAt:new Date().toISOString(),
+                exportedAtET:new Date().toLocaleString(undefined,{timeZone:"America/New_York"}),
+                summary:{
+                  totalTrades:trades.closedTrades.length,
+                  wins:trades.closedTrades.filter(t=>t.pnl>=0).length,
+                  losses:trades.closedTrades.filter(t=>t.pnl<0).length,
+                  netPnl:trades.closedTrades.reduce((a,t)=>a+t.pnl,0),
+                  netPnlPct:((trades.balance-STARTING_BALANCE)/STARTING_BALANCE)*100,
+                },
+                trades:trades.closedTrades.slice().reverse().map((c,i)=>buildTradeReport(c,trades.closedTrades.length-i).json),
+              };
+              const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
+              const url=URL.createObjectURL(blob);
+              const a=document.createElement("a");
+              const dateStr=new Date().toISOString().split("T")[0];
+              a.href=url;a.download=`tradeedge-reports-${dateStr}.json`;
+              document.body.appendChild(a);a.click();document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            }} style={{background:"#0d0d0d",border:"1px solid #2a2a2a",color:"#e8e8e8",padding:"4px 10px",fontSize:10,cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>DOWNLOAD JSON</button>
+          </div>
+        </div>
+        {!trades.closedTrades.length?<div style={S.empty}>no closed trades yet — reports will appear here after the first trade closes</div>:(
+          <div style={{maxHeight:400,overflow:"auto",marginTop:8}}>
+            {trades.closedTrades.map((c,i)=>{
+              const tradeIdx=trades.closedTrades.length-i;
+              const expanded=expandedReportId===c.id;
+              const isWin=c.pnl>=0;
+              return(
+                <div key={c.id} style={{borderBottom:"1px solid #1a1a1a",padding:"8px 0"}}>
+                  <div onClick={()=>setExpandedReportId(expanded?null:c.id)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",gap:12}}>
+                    <div style={{display:"flex",gap:12,alignItems:"center",flex:1,minWidth:0}}>
+                      <span style={{color:"#5a5a5a",fontSize:10,minWidth:30}}>#{tradeIdx}</span>
+                      <span style={{fontWeight:700,minWidth:60}}>{c.ticker}</span>
+                      <span style={{fontSize:9,color:"#5a5a5a",minWidth:70}}>{c.strategy||"—"}</span>
+                      <span style={{fontSize:9,color:isWin?"#7CFFB2":"#FF7A7A",minWidth:80}}>{c.reason}</span>
+                      <span style={{color:isWin?"#7CFFB2":"#FF7A7A",fontWeight:600}}>{fmtPct(c.pnlPct)}</span>
+                      <span style={{fontSize:10,color:isWin?"#7CFFB2":"#FF7A7A"}}>{c.pnl>=0?"+":""}${fmt(c.pnl,2)}</span>
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      <span style={{fontSize:10,color:"#5a5a5a"}}>{shortTime(c.closedAt)}</span>
+                      <button onClick={(e)=>{
+                        e.stopPropagation();
+                        const{text}=buildTradeReport(c,tradeIdx);
+                        navigator.clipboard.writeText(text).then(()=>{
+                          setReportCopiedAt(Date.now());
+                          setLastCopiedId(c.id);
+                        }).catch(()=>{});
+                      }} style={{background:"transparent",border:"1px solid #2a2a2a",color:"#5a5a5a",fontSize:9,padding:"2px 6px",cursor:"pointer",fontFamily:"inherit"}}>
+                        {lastCopiedId===c.id&&reportCopiedAt&&Date.now()-reportCopiedAt<2000?"✓":"COPY"}
+                      </button>
+                      <span style={{color:"#5a5a5a",fontSize:10,width:12,textAlign:"center"}}>{expanded?"▼":"▶"}</span>
+                    </div>
+                  </div>
+                  {expanded&&(
+                    <pre style={{background:"#060606",border:"1px solid #1a1a1a",padding:12,marginTop:8,fontSize:11,color:"#e8e8e8",fontFamily:"JetBrains Mono,monospace",whiteSpace:"pre-wrap",overflow:"auto",lineHeight:1.5}}>
+                      {buildTradeReport(c,tradeIdx).text}
+                    </pre>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <section style={S.row}>
