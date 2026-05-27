@@ -1051,12 +1051,20 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       const{minsFromOpen,isPreMarket}=getEST();
 
       // Score all tickers, sort by score, take top candidates
-      const scored=allTickersRef.current
+      const allScored=allTickersRef.current
         .filter(t=>!open.has(t))
         .map(t=>({ticker:t,score:scoreTickker(t,s)}))
-        .filter(t=>t.score>=s.minScore)
-        .sort((a,b)=>b.score-a.score)
-        .slice(0,5); // only check top 5 scored
+        .sort((a,b)=>b.score-a.score);
+      const scored=allScored.filter(t=>t.score>=s.minScore).slice(0,5);
+
+      // 🔍 DIAGNOSTIC: log which tickers fire() is actually considering
+      if(allScored.length>0&&scored.length===0){
+        const top=allScored.slice(0,3).map(t=>`${t.ticker}:${t.score}`).join(", ");
+        setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:`🔍 No tickers ≥ minScore ${s.minScore}. Top 3: ${top}`},...p.slice(0,49)]);
+      } else if(scored.length>0){
+        const list=scored.map(t=>`${t.ticker}:${t.score}`).join(", ");
+        setScanLog(p=>[{t:nowIso(),ticker:"🔍 FIRE",reason:`Considering: ${list}`},...p.slice(0,49)]);
+      }
 
       for(const {ticker} of scored){
         const check=checkEntry(ticker,s);
@@ -1064,14 +1072,21 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           setScanLog(p=>[{t:nowIso(),ticker,reason:check.reason},...p.slice(0,49)]);
           continue;
         }
-        const d=getMkt(ticker);const px=d.price;if(!px)continue;
+        const d=getMkt(ticker);const px=d.price;
+        if(!px){
+          setScanLog(p=>[{t:nowIso(),ticker,reason:`🔍 No price data (px=${px})`},...p.slice(0,49)]);
+          continue;
+        }
 
         // Risk-based position sizing
         const riskAmt=balance*(s.riskPct/100)*getRegimeMultiplier();
         const slDist=px*(s.slPct/100);
         const calcSize=riskAmt/slDist*px;
         const size=Math.min(calcSize,s.maxTradeSize,balance*0.05);
-        if(size<10)continue;
+        if(size<10){
+          setScanLog(p=>[{t:nowIso(),ticker,reason:`🔍 Size too small: $${size.toFixed(2)} (need ≥$10)`},...p.slice(0,49)]);
+          continue;
+        }
 
         const sl=px*(1-(s.slPct/100));
         const tp=px*(1+(s.tpFinalPct/100));
@@ -1086,7 +1101,10 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             else body={symbol:ticker,notional:size.toFixed(2),side:"buy",type:"market",time_in_force:"day"};
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
-          }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);continue;}
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ ORDER PLACED ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)} (Alpaca ID: ${order.id?.slice(0,8)||"—"})`},...p.slice(0,49)]);
+          }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);setScanLog(p=>[{t:nowIso(),ticker,reason:`❌ ORDER REJECTED: ${e.message||e}`.slice(0,150)},...p.slice(0,49)]);continue;}
+        } else {
+          setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ SIMULATED ENTRY ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)}`},...p.slice(0,49)]);
         }
 
         const{minsFromOpen:openMins,h:eh,m:em}=getEST();
