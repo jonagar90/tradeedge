@@ -901,15 +901,45 @@ function App(){
   }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`scan: ${e.message||e}`},...p.slice(0,9)]);}};scan();const id=setInterval(scan,settings.scanIntervalMs);return()=>{cancelled=true;clearInterval(id);};},[connStatus.state,settings.scanIntervalMs]);
 
 
-  // WebSocket — now event-driven: a ticker entering CONFIRM triggers fire() immediately
+  // WebSocket — event-driven: tickers becoming entry-eligible trigger fire() within 200ms
+  // Triggers on CONFIRM transitions AND on plausible IGNITION/INTRADAY conditions, with a 5s
+  // per-ticker cooldown so a flood of ticks doesn't fire repeatedly for the same setup.
+  const lastFireAttemptRef=useRef({});
   useEffect(()=>{if(connStatus.state!=="connected"||!allTickers.length)return;let ws=null,reconnectTimer=null;const connect=()=>{setWsStatus("connecting");try{ws=new WebSocket("wss://stream.data.alpaca.markets/v2/iex");ws.onopen=()=>ws.send(JSON.stringify({action:"auth",key:credsRef.current.keyId,secret:credsRef.current.secret}));ws.onmessage=(e)=>{try{const msgs=JSON.parse(e.data);for(const msg of msgs){if(msg.T==="success"&&msg.msg==="authenticated"){setWsStatus("live");ws.send(JSON.stringify({action:"subscribe",trades:allTickersRef.current.slice(0,100)}));}if(msg.T==="t"&&msg.S&&msg.p){const sym=msg.S,p=msg.p,v=msg.s||0,t=Date.now();
 const enteredConfirm=updateMkt(sym,p,v);
 priceRef.current[sym]=p;setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),price:p}}));
-// 🔥 Event-driven entry trigger: if a ticker just hit CONFIRM, fire() within 200ms (debounced)
-if(enteredConfirm&&fireRef.current&&!pendingFireRef.current){
+
+// 🔥 Event-driven entry trigger: check if this ticker is plausibly entry-ready right now.
+// We do a cheap field-read check (no scoring) to decide whether to invoke fire().
+// fire() then runs its full gate sequence including the precise checkEntry() logic.
+const d=getMkt(sym);
+const s=settingsRef.current;
+const{minsFromOpen}=getEST();
+const lastAttempt=lastFireAttemptRef.current[sym]||0;
+const cooldownOK=t-lastAttempt>5000; // 5s per-ticker cooldown
+let plausible=false;
+if(cooldownOK&&fireRef.current&&!pendingFireRef.current){
+  // CONFIRM transition — original trigger, always honored
+  if(enteredConfirm)plausible=true;
+  // IGNITION window check (first 15 min, high gap + RVOL)
+  else if(s.momentumIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.ignitionWindowMins||15)){
+    if(d.gapPct>=(s.ignitionMinGap||12)&&d.rvol>=(s.ignitionMinRvol||8)){
+      plausible=true;
+    }
+  }
+  // INTRADAY window check (10:30am-3:00pm, breakout setup)
+  else if(s.intradayMomentumEnabled&&minsFromOpen>(s.ignitionWindowMins||15)&&minsFromOpen<=330){
+    if(d.rvol>=(s.intradayMinRvol||6)&&d.vwap>0&&p>d.vwap){
+      plausible=true;
+    }
+  }
+}
+if(plausible){
+  lastFireAttemptRef.current[sym]=t;
   pendingFireRef.current=true;
   setTimeout(()=>{pendingFireRef.current=false;if(fireRef.current)fireRef.current();},200);
 }
+
 const openSymbols=new Set(tradesRef.current.openTrades.map(o=>o.ticker));if(openSymbols.has(sym)){setPriceSeries(prev=>{const arr=prev[sym]||[];const next=[...arr,{t,p}].filter(x=>x.t>=t-3600000);// 1h rolling window
 return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("error");ws.onclose=()=>{setWsStatus("reconnecting");reconnectTimer=setTimeout(connect,2000);};}catch(e){setWsStatus("error");reconnectTimer=setTimeout(connect,3000);}};connect();return()=>{clearTimeout(reconnectTimer);try{if(ws)ws.close();}catch(e){}setWsStatus("off");};},[connStatus.state,allTickers.length]);
 
