@@ -93,6 +93,9 @@ function updateRegime(result){
   regime.recentSignals=regime.recentSignals.filter(s=>now-s.t<1800000).slice(-10);
   const losses=regime.recentSignals.filter(s=>s.result==="LOSS").length;
   regime.failureRate=regime.recentSignals.length>0?(losses/regime.recentSignals.length)*100:0;
+  // Require minimum 5 trades before regime classification — 1-2 losses is statistical noise,
+  // not a regime change. Without this, two random small losses lock the bot in NO_TRADE.
+  if(regime.recentSignals.length<5){regime.current="TRENDING";return;}
   if(regime.failureRate>=60){regime.current="NO_TRADE";regime.noTradeUntil=now+1800000;}
   else if(regime.failureRate>=40){regime.current="CHOPPY";}
   else{regime.current="TRENDING";}
