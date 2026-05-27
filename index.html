@@ -1100,9 +1100,13 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         let alpacaOrderId=null;
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
           try{
+            // Use whole-share quantity for all orders. Notional/fractional orders are rejected by
+            // Alpaca for non-fractionable assets (most small-caps: MNTS, BRTX, etc). Whole-share
+            // orders work universally. Slight precision loss (<1% of position size) is acceptable.
+            const qty=Math.max(1,Math.floor(size/px));
             let body;
-            if(check.strategy==="PRE"){const qty=Math.max(1,Math.floor(size/px));body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day",extended_hours:true};}
-            else body={symbol:ticker,notional:size.toFixed(2),side:"buy",type:"market",time_in_force:"day"};
+            if(check.strategy==="PRE")body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day",extended_hours:true};
+            else body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
             setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ ORDER PLACED ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)} (Alpaca ID: ${order.id?.slice(0,8)||"—"})`},...p.slice(0,49)]);
