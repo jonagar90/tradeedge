@@ -1180,7 +1180,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
   const focusedTrade=focusedTicker?trades.openTrades.find(o=>o.ticker===focusedTicker):null;
   const estNow=getEST();const S=styles;
   const wsColor=wsStatus==="live"?"#7CFFB2":wsStatus==="connecting"||wsStatus==="reconnecting"?"#FFB627":"#5a5a5a";
-  const regimeColor=regimeState==="TRENDING"?"#7CFFB2":regimeState==="CHOPPY"?"#FFB627":"#FF7A7A";
+  const regimeColor=regimeState==="TRENDING"||regimeState==="UNKNOWN"?"#7CFFB2":regimeState==="CHOPPY"?"#FFB627":"#FF7A7A";
 
   return(
     <div style={S.shell}>
@@ -1190,7 +1190,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           {circuitBreaker&&<div style={{...S.pill,borderColor:"#FF7A7A",color:"#FF7A7A"}}><span style={{...S.pillDot,background:"#FF7A7A"}}/>🚨 CIRCUIT BREAKER</div>}
           <div style={{...S.pill,borderColor:regimeColor,color:regimeColor}}>
             <span style={{width:5,height:5,borderRadius:"50%",background:regimeColor,display:"inline-block",animation:regimeState==="TRENDING"?"pulse 1.5s infinite":"none"}}/>
-            {regimeState==="TRENDING"?"TRENDING":regimeState==="CHOPPY"?"CHOPPY":"NO TRADE"} · {regime.failureRate.toFixed(0)}% fail
+            {regimeState==="TRENDING"||regimeState==="UNKNOWN"?"TRENDING":regimeState==="CHOPPY"?"CHOPPY":"NO TRADE"} · {regime.failureRate.toFixed(0)}% fail
           </div>
           <div style={{...S.pill,borderColor:"#5a5a5a",color:"#5a5a5a"}}>EST {String(estNow.h).padStart(2,"0")}:{String(estNow.m).padStart(2,"0")} {estNow.isPreMarket?"PRE-MKT":estNow.isMarketOpen?"OPEN":"CLOSED"}</div>
           {connStatus.state==="connected"&&<div style={{...S.pill,borderColor:wsColor,color:wsColor,fontSize:9}}><span style={{width:5,height:5,borderRadius:"50%",background:wsColor,display:"inline-block",marginRight:4,animation:wsStatus==="live"?"pulse 1.5s infinite":"none"}}/>{wsStatus==="live"?"WS LIVE":wsStatus.toUpperCase()}</div>}
@@ -1198,7 +1198,21 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           <StatusPill running={running} stale={stale}/>
           <button onClick={()=>setRunning(r=>!r)} style={{...S.runBtn,...(running?S.runBtnStop:{})}}>{running?"■ STOP":"▶ START"}</button>
           <button onClick={()=>setSettingsOpen(o=>!o)} style={{...S.resetBtn,...(settingsOpen?{borderColor:"#FFB627",color:"#FFB627"}:{})}}>⚙ SETTINGS</button>
-          <button onClick={()=>{dispatch({type:"RESET"});setSignals([]);setDailyLoss(0);setCircuitBreaker(false);setScanLog([]);setRadar([]);setAlpacaTickers([]);}} style={S.resetBtn}>RESET</button>
+          <button onClick={()=>{
+            dispatch({type:"RESET"});
+            setSignals([]);
+            setDailyLoss(0);
+            setCircuitBreaker(false);
+            setScanLog([]);
+            setRadar([]);
+            setAlpacaTickers([]);
+            // Clear module-level regime — otherwise NO_TRADE state survives RESET
+            regime.current="UNKNOWN";
+            regime.recentSignals=[];
+            regime.failureRate=0;
+            regime.noTradeUntil=0;
+            setRegimeState("UNKNOWN");
+          }} style={S.resetBtn}>RESET</button>
         </div>
       </header>
 
