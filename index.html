@@ -359,7 +359,9 @@ function checkEntry(ticker,s){
   // === MOMENTUM IGNITION EXCEPTION (Aggressive Open Entry) ===
   // Bypass the strict pullback-state requirement for high-conviction setups within the first N minutes.
   // Designed to catch parabolic morning runners that never give a clean pullback.
-  const ignitionEnabled=s.momentumIgnitionEnabled&&minsFromOpen<=(s.ignitionWindowMins||15);
+  // NOTE: requires minsFromOpen >= 0 — only fires AFTER market open. In premarket, minsFromOpen is
+  // negative, and Alpaca rejects regular market orders ("extended hours order must be limit").
+  const ignitionEnabled=s.momentumIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.ignitionWindowMins||15);
   if(ignitionEnabled){
     const pmHigh=d.preMarketHigh||d.open||0;
     const isBreakingPMHigh=s.breakPreMarketHigh?(d.price>pmHigh*1.005):true;
