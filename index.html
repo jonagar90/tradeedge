@@ -684,13 +684,18 @@ async function getAvgDailyVol(sym,creds){
 
 // Global rate limiter — ensures we never exceed ~1 call/sec to Finnhub
 // regardless of how many tickers want data at once.
-let finnhubLastCall=0;
+// IMPORTANT: reserves the slot BEFORE awaiting, so concurrent callers see the updated
+// timestamp and queue behind each other instead of all racing past at zero.
+let finnhubNextSlot=0;
 const FINNHUB_MIN_GAP_MS=1100; // 1.1s between calls = ~55 calls/min, safe margin under 60/min
 async function finnhubRateGate(){
   const now=Date.now();
-  const wait=Math.max(0,finnhubLastCall+FINNHUB_MIN_GAP_MS-now);
+  // Atomically reserve the next slot. If queue is empty (now>=nextSlot), reserve now.
+  // Otherwise, reserve nextSlot+gap (puts us at the end of the queue).
+  const mySlot=Math.max(now,finnhubNextSlot);
+  finnhubNextSlot=mySlot+FINNHUB_MIN_GAP_MS;
+  const wait=mySlot-now;
   if(wait>0)await new Promise(r=>setTimeout(r,wait));
-  finnhubLastCall=Date.now();
 }
 
 // News cache — catalyst detection by keyword
