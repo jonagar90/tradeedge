@@ -677,79 +677,91 @@ async function getAvgDailyVol(sym,creds){
 }
 
 /* ================================================================
-   POLYGON NEWS — catalyst detection via keyword matching
+   FINNHUB — news catalyst detection + shares outstanding (float)
+   Free tier: 60 calls/min. We rate-limit to 1 call/sec for safety.
+   Single API key handles both news and profile endpoints.
    ================================================================ */
+
+// Global rate limiter — ensures we never exceed ~1 call/sec to Finnhub
+// regardless of how many tickers want data at once.
+let finnhubLastCall=0;
+const FINNHUB_MIN_GAP_MS=1100; // 1.1s between calls = ~55 calls/min, safe margin under 60/min
+async function finnhubRateGate(){
+  const now=Date.now();
+  const wait=Math.max(0,finnhubLastCall+FINNHUB_MIN_GAP_MS-now);
+  if(wait>0)await new Promise(r=>setTimeout(r,wait));
+  finnhubLastCall=Date.now();
+}
+
+// News cache — catalyst detection by keyword
 const newsCache={}; // {TICKER: {fetchedAt, articles:[], hasCatalyst, fetching, matchedKeywords:[]}}
 const NEWS_CACHE_TTL_MS=30*60*1000; // 30 min
 const CATALYST_KEYWORDS=[
   "fda","contract","merger","earnings","partnership","approval",
   "acquisition","deal","agreement","results","announcement",
-  // common variations
   "approved","awarded","acquires","acquired","signs","completes","announces",
   "reports","beats","clinical","phase","trial","license","launch","launches"
 ];
 
-async function fetchPolygonNews(ticker,apiKey){
+async function fetchFinnhubNews(ticker,apiKey){
   const cached=newsCache[ticker];
   if(cached&&!cached.fetching&&Date.now()-cached.fetchedAt<NEWS_CACHE_TTL_MS)return cached;
   if(cached?.fetching)return cached;
   newsCache[ticker]={...(cached||{}),fetching:true};
   try{
-    // 24h window — published_utc >= now - 24h
-    const since=new Date(Date.now()-24*60*60*1000).toISOString();
-    const url=`https://api.polygon.io/v2/reference/news?ticker=${ticker}&published_utc.gte=${since}&limit=10&apiKey=${apiKey}`;
+    await finnhubRateGate();
+    // Finnhub company-news: requires from/to dates (YYYY-MM-DD), looks back 2 days to catch late-night PRs
+    const today=new Date();
+    const twoDaysAgo=new Date(Date.now()-2*86400000);
+    const fmt=d=>d.toISOString().split("T")[0];
+    const url=`https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(ticker)}&from=${fmt(twoDaysAgo)}&to=${fmt(today)}&token=${apiKey}`;
     const r=await fetch(url);
-    if(!r.ok)throw new Error(`Polygon news ${r.status}`);
-    const j=await r.json();
-    const articles=j?.results||[];
-    // Catalyst detection: scan title + description for keywords
+    if(!r.ok)throw new Error(`Finnhub news ${r.status}`);
+    const articles=await r.json();
+    // Filter to last 24h only (Finnhub returns up to 2 days, we want 24h for "recent catalyst")
+    const cutoff=Date.now()/1000-24*3600;
+    const recent=Array.isArray(articles)?articles.filter(a=>a.datetime>=cutoff):[];
+    // Catalyst detection: scan headline + summary for keywords
     let hasCatalyst=false;
     const matched=new Set();
-    for(const a of articles){
-      const text=`${a.title||""} ${a.description||""}`.toLowerCase();
+    for(const a of recent){
+      const text=`${a.headline||""} ${a.summary||""}`.toLowerCase();
       for(const kw of CATALYST_KEYWORDS){
         if(text.includes(kw)){hasCatalyst=true;matched.add(kw);}
       }
     }
-    const result={fetchedAt:Date.now(),articles,hasCatalyst,matchedKeywords:Array.from(matched),fetching:false};
+    const result={fetchedAt:Date.now(),articles:recent,hasCatalyst,matchedKeywords:Array.from(matched),fetching:false};
     newsCache[ticker]=result;
     return result;
   }catch(e){
-    reportDataError(`${ticker}: news fetch failed — ${e.message||e}`);
+    reportDataError(`${ticker}: Finnhub news failed — ${e.message||e}`);
     newsCache[ticker]={...(cached||{fetchedAt:0,articles:[],hasCatalyst:false,matchedKeywords:[]}),fetching:false};
     return newsCache[ticker];
   }
 }
 
-/* ================================================================
-   FMP FLOAT — shares outstanding for low-float filter
-   ================================================================ */
+// Profile cache — shares outstanding (used as float proxy)
 const floatCache={}; // {TICKER: {floatShares, fetchedAt, fetching}}
-const FLOAT_CACHE_TTL_MS=24*60*60*1000; // 24 hours (float changes maybe 1-2x/year)
+const FLOAT_CACHE_TTL_MS=24*60*60*1000; // 24 hours
 
-async function fetchFloat(ticker,apiKey){
+async function fetchFinnhubProfile(ticker,apiKey){
   const cached=floatCache[ticker];
   if(cached&&!cached.fetching&&Date.now()-cached.fetchedAt<FLOAT_CACHE_TTL_MS)return cached.floatShares;
   if(cached?.fetching)return cached?.floatShares||0;
   floatCache[ticker]={...(cached||{floatShares:0,fetchedAt:0}),fetching:true};
   try{
-    // FMP key-metrics-ttm has sharesOutstanding; profile has floatShares (preferred)
-    const url=`https://financialmodelingprep.com/api/v3/profile/${ticker}?apikey=${apiKey}`;
+    await finnhubRateGate();
+    const url=`https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(ticker)}&token=${apiKey}`;
     const r=await fetch(url);
-    if(!r.ok)throw new Error(`FMP profile ${r.status}`);
+    if(!r.ok)throw new Error(`Finnhub profile ${r.status}`);
     const j=await r.json();
-    const row=Array.isArray(j)?j[0]:j;
-    // FMP returns mktCap / volAvg / etc. Float specifically lives on /v4/shares_float
-    // but the free /v3/profile endpoint includes "mktCap" and "lastDiv" — not float directly.
-    // Use mktCap / price as a proxy for shares outstanding (close enough for filter purposes).
-    const price=row?.price||0;
-    const mktCap=row?.mktCap||0;
-    let floatShares=0;
-    if(price>0&&mktCap>0)floatShares=mktCap/price; // approx shares outstanding
+    // Finnhub returns shareOutstanding in millions (e.g. 5.23 = 5.23M shares)
+    const sharesMillions=j?.shareOutstanding||0;
+    const floatShares=sharesMillions*1e6;
     floatCache[ticker]={floatShares,fetchedAt:Date.now(),fetching:false};
     return floatShares;
   }catch(e){
-    reportDataError(`${ticker}: float fetch failed — ${e.message||e}`);
+    reportDataError(`${ticker}: Finnhub profile failed — ${e.message||e}`);
     floatCache[ticker]={...(cached||{floatShares:0,fetchedAt:0}),fetching:false};
     return cached?.floatShares||0;
   }
@@ -882,10 +894,8 @@ function App(){
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [tradeSize,setTradeSize]=useState(25);
   const [anthropicKey,setAnthropicKey]=useState("");
-  const [polygonKey,setPolygonKey]=useState("");
-  const [fmpKey,setFmpKey]=useState("");
-  const polygonKeyRef=useRef(polygonKey);useEffect(()=>{polygonKeyRef.current=polygonKey;},[polygonKey]);
-  const fmpKeyRef=useRef(fmpKey);useEffect(()=>{fmpKeyRef.current=fmpKey;},[fmpKey]);
+  const [finnhubKey,setFinnhubKey]=useState("");
+  const finnhubKeyRef=useRef(finnhubKey);useEffect(()=>{finnhubKeyRef.current=finnhubKey;},[finnhubKey]);
   const [signals,setSignals]=useState([]);
   const [scanLog,setScanLog]=useState([]);
   const [radar,setRadar]=useState([]);
@@ -972,32 +982,29 @@ function App(){
       await Promise.race([Promise.all(prewarmPromises),new Promise(r=>setTimeout(r,3000))]);
     }
     if(cancelled)return;
-    // Polygon news + FMP float fetches — fire-and-forget so they don't slow the scan.
-    // Results populate getMkt(sym).hasCatalyst / .floatShares as they arrive.
-    // Caches handle TTL and dedupe in-flight requests.
-    const polyKey=polygonKeyRef.current,fmpKeyVal=fmpKeyRef.current;
-    for(const sym of syms){
-      if(polyKey){
+    // Finnhub news + profile (float) fetches — fire-and-forget, rate-limited globally to ~55 calls/min.
+    // Results populate getMkt(sym).hasCatalyst / .floatShares as they arrive (may take 30+ seconds
+    // to cycle through all 30 tickers on first scan, then near-instant from cache for subsequent scans).
+    const fhKey=finnhubKeyRef.current;
+    if(fhKey){
+      for(const sym of syms){
         const cached=newsCache[sym];
         if(!cached||(!cached.fetching&&Date.now()-cached.fetchedAt>NEWS_CACHE_TTL_MS)){
-          fetchPolygonNews(sym,polyKey).then(res=>{
+          fetchFinnhubNews(sym,fhKey).then(res=>{
             const d=getMkt(sym);
             d.hasCatalyst=res.hasCatalyst;
             d.matchedKeywords=res.matchedKeywords;
             d.catalystArticles=res.articles.length;
           });
         } else if(cached.fetchedAt>0){
-          // Already cached — copy into mkt
           const d=getMkt(sym);
           d.hasCatalyst=cached.hasCatalyst;
           d.matchedKeywords=cached.matchedKeywords;
           d.catalystArticles=cached.articles.length;
         }
-      }
-      if(fmpKeyVal){
         const fcached=floatCache[sym];
         if(!fcached||(!fcached.fetching&&Date.now()-fcached.fetchedAt>FLOAT_CACHE_TTL_MS)){
-          fetchFloat(sym,fmpKeyVal).then(shares=>{getMkt(sym).floatShares=shares;});
+          fetchFinnhubProfile(sym,fhKey).then(shares=>{getMkt(sym).floatShares=shares;});
         } else if(fcached.fetchedAt>0){
           getMkt(sym).floatShares=fcached.floatShares;
         }
@@ -1342,7 +1349,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         </div>
       </header>
 
-      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} anthropicKey={anthropicKey} onAnthropicKeyChange={setAnthropicKey} polygonKey={polygonKey} onPolygonKeyChange={setPolygonKey} fmpKey={fmpKey} onFmpKeyChange={setFmpKey}/>}
+      {settingsOpen&&<SettingsDrawer settings={settings} onChange={setSettings} onReset={()=>setSettings(DEFAULT_SETTINGS)} onClose={()=>setSettingsOpen(false)} creds={creds} onCredsChange={setCreds} connStatus={connStatus} onTest={testConnection} execMode={execMode} onModeChange={setExecMode} alpacaAccount={alpacaAccount} alpacaErrors={alpacaErrors} anthropicKey={anthropicKey} onAnthropicKeyChange={setAnthropicKey} finnhubKey={finnhubKey} onFinnhubKeyChange={setFinnhubKey}/>}
 
       <section style={S.row}>
         <div style={{...S.card,flex:2}}>
@@ -1671,7 +1678,7 @@ function AlpacaAccountCard({account,positions,mode,errors}){
   return<section style={{...styles.card,borderLeft:"2px solid #FFB627"}}><div style={styles.cardHead}><div><div style={styles.cardLabel}>ALPACA PAPER · {account.account_number}{mode==="alpaca"?<span style={{color:"#FFB627",marginLeft:10}}>· ORDERS LIVE</span>:<span style={{color:"#5a5a5a",marginLeft:10}}>· read-only</span>}</div><div style={styles.cardBigNum}>${fmt(equity,2)} <span style={{...styles.delta,color:dayPnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(dayPnlPct)} today</span></div></div><div style={{display:"grid",gridTemplateColumns:"repeat(4,auto)",gap:16}}><Diag label="BUYING POWER" value={`$${fmt(bp,0)}`}/><Diag label="CASH" value={`$${fmt(Number(account.cash),0)}`}/><Diag label="POSITIONS" value={positions.length}/><Diag label="STATUS" value={account.status}/></div></div>{errors.length>0&&<div style={{marginTop:12}}><div style={styles.cardLabel}>API ERRORS</div><div style={{maxHeight:60,overflow:"auto",fontSize:10,color:"#FF7A7A"}}>{errors.slice(0,3).map((e,i)=><div key={i}><span style={{color:"#5a5a5a"}}>{shortTime(new Date(e.t).toISOString())}</span> {e.msg}</div>)}</div></div>}</section>;
 }
 
-function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount,anthropicKey,onAnthropicKeyChange,polygonKey,onPolygonKeyChange,fmpKey,onFmpKeyChange}){
+function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,connStatus,onTest,execMode,onModeChange,alpacaAccount,anthropicKey,onAnthropicKeyChange,finnhubKey,onFinnhubKeyChange}){
   const set=(k,v)=>onChange({...settings,[k]:v});
   return(
     <section style={styles.settingsCard}>
@@ -1694,18 +1701,11 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
         {anthropicKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {anthropicKey.slice(0,16)}…</div>}
       </div>
       <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
-        <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>POLYGON API KEY (catalyst news)</div>
-        <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ memory only · polygon.io · used for news catalyst detection</div>
-        <SecretField label="POLYGON API KEY" value={polygonKey} placeholder="paste polygon.io key…" onChange={onPolygonKeyChange} mask/>
-        {polygonKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {polygonKey.slice(0,12)}…  · news + catalyst detection active</div>}
-        {!polygonKey&&<div style={{marginTop:6,fontSize:10,color:"#5a5a5a"}}>without this key: 📰 catalyst badges and catalyst filter will not work</div>}
-      </div>
-      <div style={{...styles.settingGroup,borderColor:"#7CFFB2",marginBottom:14}}>
-        <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>FMP API KEY (float / shares outstanding)</div>
-        <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ memory only · financialmodelingprep.com · free tier 250 calls/day</div>
-        <SecretField label="FMP API KEY" value={fmpKey} placeholder="paste FMP key…" onChange={onFmpKeyChange} mask/>
-        {fmpKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {fmpKey.slice(0,12)}…  · float data active</div>}
-        {!fmpKey&&<div style={{marginTop:6,fontSize:10,color:"#5a5a5a"}}>without this key: 🐜 low-float badges will not appear</div>}
+        <div style={{...styles.settingGroupTitle,color:"#7CFFB2"}}>FINNHUB API KEY (news + float)</div>
+        <div style={{...styles.alpacaWarn,marginBottom:10}}>⚠ memory only · finnhub.io · free tier 60 calls/min · provides catalyst news + shares outstanding</div>
+        <SecretField label="FINNHUB API KEY" value={finnhubKey} placeholder="paste finnhub.io key…" onChange={onFinnhubKeyChange} mask/>
+        {finnhubKey&&<div style={{marginTop:6,fontSize:10,color:"#7CFFB2"}}>✓ key set — {finnhubKey.slice(0,12)}…  · catalyst + float detection active</div>}
+        {!finnhubKey&&<div style={{marginTop:6,fontSize:10,color:"#5a5a5a"}}>without this key: 📰 catalyst and 🐜 low-float badges will not appear</div>}
       </div>
       <div style={{...styles.settingGroup,borderColor:"#FFB627",marginBottom:14}}>
         <div style={{...styles.settingGroupTitle,color:"#FFB627"}}>ALPACA PAPER ACCOUNT</div>
