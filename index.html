@@ -45,6 +45,9 @@ const DEFAULT_SETTINGS = {
   preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
   cooldownMs:1800000, // 30 min cooldown after SL
   riskPct:0.5,        // risk 0.5% per trade
+  // --- Testing toggles (disable safety brakes to maximize trade volume) ---
+  regimeBrakeEnabled:true,  // when false, NO_TRADE/CHOPPY regime never blocks trades
+  cooldownEnabled:true,     // when false, no 30-min cooldown after a stop-loss
   // --- Momentum Ignition (aggressive open entry, first N minutes) ---
   momentumIgnitionEnabled:true,
   ignitionWindowMins:15,
@@ -305,7 +308,7 @@ function scoreTickker(ticker,s){
   // Penalty — failed breakouts
   if(d.failedBreakouts>=3&&Date.now()-d.lastFailTime<1800000)score-=30;
   // Penalty — recent SL
-  if(Date.now()-d.lastSlTime<s.cooldownMs)score=-100;
+  if(s.cooldownEnabled&&Date.now()-d.lastSlTime<s.cooldownMs)score=-100;
   d.score=Math.max(0,Math.min(100,score));
   return d.score;
 }
@@ -334,19 +337,21 @@ function checkEntry(ticker,s){
   if(minsFromOpen>360)return{pass:false,reason:"After 3:30pm"};
   const{h,m}=getEST();
   // Dead zone 11:30am-2pm unless continuation explicitly on
-  if(h===11&&m>=30&&h<14&&regime.current==="CHOPPY")return{pass:false,reason:"Dead zone (11:30-2pm choppy)"};
+  if(s.regimeBrakeEnabled&&h===11&&m>=30&&h<14&&regime.current==="CHOPPY")return{pass:false,reason:"Dead zone (11:30-2pm choppy)"};
   // 30 min before close
   if(minsFromOpen>360)return{pass:false,reason:"< 30 min to close"};
 
-  // Regime gate
-  if(regime.current==="NO_TRADE")return{pass:false,reason:`🚫 NO_TRADE regime (${regime.failureRate.toFixed(0)}% fail rate)`};
-  if(regime.current==="CHOPPY"&&d.gapPct<15)return{pass:false,reason:"CHOPPY regime — gap < 15% required"};
+  // Regime gate (skippable for testing via regimeBrakeEnabled)
+  if(s.regimeBrakeEnabled){
+    if(regime.current==="NO_TRADE")return{pass:false,reason:`🚫 NO_TRADE regime (${regime.failureRate.toFixed(0)}% fail rate)`};
+    if(regime.current==="CHOPPY"&&d.gapPct<15)return{pass:false,reason:"CHOPPY regime — gap < 15% required"};
+  }
 
   // Price filter
   if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside $${s.priceMin}-$${s.priceMax}`};
 
-  // Cooldown / blacklist
-  if(now-d.lastSlTime<s.cooldownMs)return{pass:false,reason:`Cooldown — SL hit ${Math.round((now-d.lastSlTime)/60000)}m ago`};
+  // Cooldown / blacklist (skippable for testing via cooldownEnabled)
+  if(s.cooldownEnabled&&now-d.lastSlTime<s.cooldownMs)return{pass:false,reason:`Cooldown — SL hit ${Math.round((now-d.lastSlTime)/60000)}m ago`};
   if(d.failedBreakouts>=3&&now-d.lastFailTime<1800000)return{pass:false,reason:`Blacklisted — 3 failed breakouts`};
 
   // Score gate
@@ -1051,7 +1056,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
     if(!running)return;
     const fire=async()=>{
       if(circuitBreaker){setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:"🚨 Circuit breaker"},...p.slice(0,49)]);return;}
-      if(regime.current==="NO_TRADE"){setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:`🚫 NO_TRADE regime (${regime.failureRate.toFixed(0)}% fail rate)`},...p.slice(0,49)]);return;}
+      if(settingsRef.current.regimeBrakeEnabled&&regime.current==="NO_TRADE"){setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:`🚫 NO_TRADE regime (${regime.failureRate.toFixed(0)}% fail rate)`},...p.slice(0,49)]);return;}
       const open=new Set(tradesRef.current.openTrades.map(t=>t.ticker));
       const openCount=tradesRef.current.openTrades.length;
       if(openCount>=settingsRef.current.maxOpenTrades){return;}
@@ -1602,6 +1607,19 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)}/>
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)}/>
           <NumField label="COOLDOWN AFTER SL (ms)" value={settings.cooldownMs} min={300000} max={7200000} step={300000} onChange={v=>set("cooldownMs",v)} help="30min default"/>
+        </SettingGroup>
+        <SettingGroup title="🧪 TESTING MODE">
+          <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>Turn these OFF to maximize trade volume while testing. Turn back ON for real trading.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.regimeBrakeEnabled} onChange={e=>set("regimeBrakeEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>REGIME BRAKE ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>When ON: bot stops trading after too many losses (NO_TRADE / CHOPPY regimes). When OFF: trades regardless of recent win/loss streak.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.cooldownEnabled} onChange={e=>set("cooldownEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>SL COOLDOWN ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,lineHeight:1.4}}>When ON: a ticker is blocked for 30min after hitting a stop-loss. When OFF: can re-enter immediately.</div>
         </SettingGroup>
         <SettingGroup title="TIMING">
           <NumField label="SCAN INTERVAL MS" value={settings.scanIntervalMs} min={10000} max={300000} step={5000} onChange={v=>set("scanIntervalMs",v)}/>
