@@ -64,6 +64,19 @@ const DEFAULT_SETTINGS = {
   // --- EOD force-close (capital protection) ---
   eodCloseEnabled:true,
   eodCloseMinsBeforeClose:30,  // close all positions 30 min before 4pm = 3:30pm
+  // --- QUALITY SETUP (strict A+ filters: float, catalyst, breakout, structure) ---
+  qualitySetupEnabled:false,    // OFF by default — opt-in lane
+  qualityMaxFloat:20000000,     // 20M shares max
+  qualityMinGap:20,             // gap range min
+  qualityMaxGap:150,            // gap range max
+  qualityMinRvol:15,            // RVOL minimum (very strict)
+  qualityRequireCatalyst:true,  // require 📰 news catalyst
+  qualityRsiMin:45,             // 5-min RSI range min
+  qualityRsiMax:68,             // 5-min RSI range max (rejects extended)
+  qualityWindowStartMins:15,    // start of entry window in mins from open (9:45am = 15)
+  qualityWindowEndMins:60,      // end of entry window (10:30am = 60)
+  qualityBreakoutLevel:"PMH_OR_ORH", // require break of premarket high OR opening range high
+  qualityVolumeSurgeMultiplier:2, // 1-min volume must be 2x avg of last 10 mins
 };
 const STARTING_BALANCE = DEFAULT_SETTINGS.startingBalance;
 
@@ -125,6 +138,11 @@ const getMkt=t=>{
     priceHistory:[],   // raw ticks
     candles1m:[],      // 1m OHLCV
     currentCandle:null,
+    candles5m:[],      // 5m OHLCV — used for 5-min RSI in Quality Setup lane
+    currentCandle5m:null,
+    openingRangeHigh:0,   // first 15 min high after market open
+    openingRangeLow:0,    // first 15 min low after market open
+    openingRangeDone:false,
     ema9:0,ema21:0,ema50:0,
     vwapNum:0,vwapDen:0,vwap:0,
     firstCandleHigh:0,firstCandleLow:0,firstCandleDone:false,
@@ -169,6 +187,16 @@ function calcRSI(prices){
   return 100-(100/(1+(g/n)/Math.max(l/n,0.0001)));
 }
 
+// 5-min RSI — computed from the closes of completed 5-min candles.
+// Standard period is 14, but we accept whatever 5m candles we have (min 2).
+// Returns 50 (neutral) if insufficient data.
+function calcRSI5m(candles5m,period=14){
+  if(!candles5m||candles5m.length<2)return 50;
+  // Use last `period` candle closes (need at least 2 closes to compute changes)
+  const closes=candles5m.slice(-period-1).map(c=>c.close);
+  return calcRSI(closes);
+}
+
 function calcATR(candles,period=14){
   if(candles.length<2)return 0;
   const trs=candles.slice(-period).map((c,i,a)=>{
@@ -209,6 +237,25 @@ function updateMkt(ticker,price,volume,prevClose,open){
     d.currentCandle.close=price;
     d.currentCandle.volume+=(volume||0);
   }
+  // 5m candle building — bucket minutes into 5-min slots (0-4 = slot 0, 5-9 = slot 1, etc.)
+  const fiveMinSlot=Math.floor(m/5)*5;
+  const fiveMinKey=`${h}:${String(fiveMinSlot).padStart(2,"0")}`;
+  if(!d.currentCandle5m||d.currentCandle5m.key!==fiveMinKey){
+    if(d.currentCandle5m)d.candles5m.push({...d.currentCandle5m});
+    if(d.candles5m.length>30)d.candles5m.shift(); // keep last 30 = 2.5 hours
+    d.currentCandle5m={key:fiveMinKey,open:price,high:price,low:price,close:price,volume:volume||0,t:now};
+  } else {
+    d.currentCandle5m.high=Math.max(d.currentCandle5m.high,price);
+    d.currentCandle5m.low=Math.min(d.currentCandle5m.low,price);
+    d.currentCandle5m.close=price;
+    d.currentCandle5m.volume+=(volume||0);
+  }
+  // Opening Range (first 15 min after open) — high/low for breakout detection
+  if(minsFromOpen>=0&&minsFromOpen<15){
+    if(price>d.openingRangeHigh)d.openingRangeHigh=price;
+    if(d.openingRangeLow===0||price<d.openingRangeLow)d.openingRangeLow=price;
+  }
+  if(minsFromOpen===15&&!d.openingRangeDone)d.openingRangeDone=true;
   // ATR
   if(d.candles1m.length>=2){const atr=calcATR(d.candles1m);d.atr=atr;d.atrHistory.push(atr);if(d.atrHistory.length>14)d.atrHistory.shift();}
   // RVOL is now set externally by the Alpaca scanner using time-scaled 20-day baseline.
@@ -365,6 +412,88 @@ function checkEntry(ticker,s){
 
   // Gap requirement
   if(d.gapPct<s.gapMinPct)return{pass:false,reason:`Gap ${d.gapPct.toFixed(1)}% < ${s.gapMinPct}%`};
+
+  // === ⭐ QUALITY SETUP LANE (strict A+ filters) ===
+  // The most selective lane. All 10 conditions must be true. Designed for highest probability
+  // setups during the 9:45-10:30am morning momentum window. Expected to fire 0-3 trades per day.
+  if(s.qualitySetupEnabled&&minsFromOpen>=(s.qualityWindowStartMins||15)&&minsFromOpen<=(s.qualityWindowEndMins||60)){
+    // Compute the criteria — track each individually so we can report which one failed
+    const checks={};
+    // 1. Float — must be < qualityMaxFloat. If floatShares is 0, data hasn't arrived yet, fail safe.
+    checks.float=d.floatShares>0&&d.floatShares<=(s.qualityMaxFloat||20000000);
+    // 2. Gap within range
+    checks.gap=d.gapPct>=(s.qualityMinGap||20)&&d.gapPct<=(s.qualityMaxGap||150);
+    // 3. RVOL ≥ threshold (15x default)
+    checks.rvol=d.rvol>=(s.qualityMinRvol||15);
+    // 4. Catalyst — news with matching keywords in last 24h
+    checks.catalyst=!s.qualityRequireCatalyst||d.hasCatalyst===true;
+    // 5. Price > VWAP AND price > EMA9 (must be above both)
+    checks.aboveVwap=d.vwap>0&&d.price>d.vwap;
+    checks.aboveEma9=d.ema9>0&&d.price>d.ema9;
+    // 6. 5-min RSI in range 45-68 (computed on 5-min candle closes, not ticks)
+    const rsi5m=calcRSI5m(d.candles5m);
+    checks.rsi=rsi5m>=(s.qualityRsiMin||45)&&rsi5m<=(s.qualityRsiMax||68);
+    // 7. Breakout confirmation — price above PMH or Opening Range High
+    const pmHigh=d.preMarketHigh||0;
+    const orh=d.openingRangeHigh||0;
+    const breakoutLevel=Math.max(pmHigh,orh);
+    checks.breakout=breakoutLevel>0&&d.price>breakoutLevel;
+    // 8. Volume surge — current 1-min volume >= 2x avg of last 10 1-min candles
+    let volSurge=false;
+    if(d.candles1m.length>=10&&d.currentCandle){
+      const last10=d.candles1m.slice(-10);
+      const avgVol=last10.reduce((a,c)=>a+(c.volume||0),0)/10;
+      const currentVol=d.currentCandle.volume||0;
+      volSurge=avgVol>0&&currentVol>=avgVol*(s.qualityVolumeSurgeMultiplier||2);
+    }
+    checks.volSurge=volSurge;
+    // 9. Structure — higher low formed in last 3 5m candles OR strong green candle closing near highs
+    let structure=false;
+    if(d.candles5m.length>=3){
+      const last3=d.candles5m.slice(-3);
+      const higherLows=last3.every((c,i)=>i===0||c.low>=last3[i-1].low);
+      const lastCandle=last3[last3.length-1];
+      const candleRange=lastCandle.high-lastCandle.low;
+      const candleBody=lastCandle.close-lastCandle.open;
+      const isGreen=candleBody>0;
+      const closesNearHigh=candleRange>0&&((lastCandle.high-lastCandle.close)/candleRange)<0.25;
+      structure=higherLows||(isGreen&&closesNearHigh);
+    }
+    checks.structure=structure;
+    // All must pass
+    const allPass=Object.values(checks).every(v=>v===true);
+    if(allPass){
+      return{
+        pass:true,
+        rsi:rsi5m,
+        rvol:d.rvol,
+        gapPct:d.gapPct,
+        strategy:"QUALITY",
+        score:Math.max(score,85), // boost score so it ranks above IGNITION/INTRADAY
+        vwap:d.vwap,
+        ema9:d.ema9
+      };
+    }
+    // Report the FIRST failing criterion for visibility
+    const failed=Object.entries(checks).find(([k,v])=>!v);
+    if(failed){
+      const reasons={
+        float:d.floatShares>0?`Float ${(d.floatShares/1e6).toFixed(1)}M > ${(s.qualityMaxFloat/1e6).toFixed(0)}M max`:"Float data not loaded",
+        gap:`Gap ${d.gapPct.toFixed(1)}% outside ${s.qualityMinGap}-${s.qualityMaxGap}%`,
+        rvol:`RVOL ${d.rvol.toFixed(1)}x < ${s.qualityMinRvol}x min`,
+        catalyst:"No catalyst (no 📰 news)",
+        aboveVwap:`Below VWAP ($${(d.price).toFixed(2)} vs $${(d.vwap||0).toFixed(2)})`,
+        aboveEma9:`Below EMA9 ($${(d.price).toFixed(2)} vs $${(d.ema9||0).toFixed(2)})`,
+        rsi:`5m RSI ${rsi5m.toFixed(0)} outside ${s.qualityRsiMin}-${s.qualityRsiMax}`,
+        breakout:`No breakout (price $${d.price.toFixed(2)} ≤ ref $${breakoutLevel.toFixed(2)})`,
+        volSurge:"No 1-min vol surge (< 2x avg)",
+        structure:"No higher-low or strong green candle",
+      };
+      // Note: we DON'T return here — we let the trade fall through to IGNITION/INTRADAY/standard
+      // lanes. The failure reason is captured in d.lastQualityFail for diagnostics.
+      d.lastQualityFail=reasons[failed[0]]||failed[0];
+    }
+  }
 
   // === MOMENTUM IGNITION EXCEPTION (Aggressive Open Entry) ===
   // Bypass the strict pullback-state requirement for high-conviction setups within the first N minutes.
@@ -1066,6 +1195,13 @@ let plausible=false;
 if(cooldownOK&&fireRef.current&&!pendingFireRef.current){
   // CONFIRM transition — original trigger, always honored
   if(enteredConfirm)plausible=true;
+  // QUALITY window check (9:45-10:30am, the strictest A+ setup lane — highest priority)
+  else if(s.qualitySetupEnabled&&minsFromOpen>=(s.qualityWindowStartMins||15)&&minsFromOpen<=(s.qualityWindowEndMins||60)){
+    // Lightweight pre-check: must be high-RVOL with a catalyst, full check happens in fire()
+    if(d.rvol>=(s.qualityMinRvol||15)&&d.hasCatalyst&&d.vwap>0&&p>d.vwap){
+      plausible=true;
+    }
+  }
   // IGNITION window check (first 15 min, high gap + RVOL)
   else if(s.momentumIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.ignitionWindowMins||15)){
     if(d.gapPct>=(s.ignitionMinGap||12)&&d.rvol>=(s.ignitionMinRvol||8)){
@@ -1475,7 +1611,9 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                       <td style={{...S.td,fontSize:9}}>
                         <div style={{display:"flex",gap:4,alignItems:"center"}}>
                           {check.pass?(
-                            check.strategy==="IGNITION"
+                            check.strategy==="QUALITY"
+                              ?<span style={{color:"#7CFFB2",fontWeight:700}}>⭐ QUALITY</span>
+                              :check.strategy==="IGNITION"
                               ?<span style={{color:"#FF6B35",fontWeight:700}}>🔥 IGNITION</span>
                               :check.strategy==="INTRADAY"
                               ?<span style={{color:"#FFD23F",fontWeight:700}}>⚡ INTRADAY</span>
@@ -1805,6 +1943,28 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           </label>
           <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Force-close all open positions N minutes before market close. Prevents overnight gap risk.</div>
           <NumField label="MINUTES BEFORE 4PM CLOSE" value={settings.eodCloseMinsBeforeClose} min={5} max={60} step={5} onChange={v=>set("eodCloseMinsBeforeClose",v)} help="default 30 = 3:30pm close"/>
+        </SettingGroup>
+        <SettingGroup title="⭐ QUALITY SETUP (strict A+ lane)">
+          <div style={{fontSize:9,color:"#7CFFB2",marginBottom:6,lineHeight:1.4}}>The strictest entry filter: float, gap, RVOL, catalyst, breakout, structure. Runs 9:45-10:30am. Expect 0-3 trades/day.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.qualitySetupEnabled} onChange={e=>set("qualitySetupEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>QUALITY MODE ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Adds a new ⭐ QUALITY lane. Runs alongside IGNITION/INTRADAY — turn off the others to A/B test.</div>
+          <NumField label="MAX FLOAT (millions of shares)" value={settings.qualityMaxFloat/1e6} min={1} max={500} step={1} onChange={v=>set("qualityMaxFloat",v*1e6)} help="reject if float &gt; this. Default 20M."/>
+          <NumField label="MIN GAP %" value={settings.qualityMinGap} min={5} max={100} step={1} onChange={v=>set("qualityMinGap",v)} help="default 20"/>
+          <NumField label="MAX GAP %" value={settings.qualityMaxGap} min={50} max={500} step={10} onChange={v=>set("qualityMaxGap",v)} help="default 150"/>
+          <NumField label="MIN RVOL (x)" value={settings.qualityMinRvol} min={5} max={100} step={1} onChange={v=>set("qualityMinRvol",v)} help="default 15x. Very strict."/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.qualityRequireCatalyst} onChange={e=>set("qualityRequireCatalyst",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>REQUIRE CATALYST (📰)</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Skip tickers without recent news matching catalyst keywords.</div>
+          <NumField label="5m RSI MIN" value={settings.qualityRsiMin} min={30} max={60} step={1} onChange={v=>set("qualityRsiMin",v)} help="default 45"/>
+          <NumField label="5m RSI MAX" value={settings.qualityRsiMax} min={55} max={85} step={1} onChange={v=>set("qualityRsiMax",v)} help="default 68. Rejects extended."/>
+          <NumField label="WINDOW START (mins from open)" value={settings.qualityWindowStartMins} min={0} max={60} step={5} onChange={v=>set("qualityWindowStartMins",v)} help="default 15 = 9:45am"/>
+          <NumField label="WINDOW END (mins from open)" value={settings.qualityWindowEndMins} min={15} max={120} step={5} onChange={v=>set("qualityWindowEndMins",v)} help="default 60 = 10:30am"/>
+          <NumField label="VOL SURGE MULTIPLIER" value={settings.qualityVolumeSurgeMultiplier} min={1} max={10} step={0.5} onChange={v=>set("qualityVolumeSurgeMultiplier",v)} help="1-min vol ≥ N× avg of last 10 mins. Default 2x."/>
         </SettingGroup>
       </div>
     </section>
