@@ -216,6 +216,34 @@ function calcRSI5m(candles5m,period=14){
   return calcRSI(closes);
 }
 
+// "Holding EMA9" — true if the EMA9 is acting as support rather than resistance.
+// Used for QUALITY lane to catch stocks consolidating/breaking out above EMA9, instead of
+// requiring price > EMA9 at every single tick (which rejects valid setups during consolidation).
+//
+// Three conditions, ALL must be true:
+//   1. Current price is at or near EMA9 (within 0.3% on either side — wider on the upside)
+//   2. At least one recent candle has touched EMA9 (proves we're using it as a level)
+//   3. None of the recent candle CLOSES were below EMA9 × 0.998 (closes must hold, wicks ok)
+//
+// This catches the "higher highs, higher lows, holding EMA9 like a trampoline" pattern.
+// Rejects stocks where EMA9 just got broken to the downside (asymmetric protection).
+function isHoldingEma9(candles1m,ema9Current,priceNow,lookback=5){
+  if(!ema9Current||ema9Current<=0)return false;
+  if(!candles1m||candles1m.length<lookback)return false;
+  // Condition 1: price close to EMA9 — allow up to 5% above (extended is ok), max 0.3% below
+  if(priceNow<ema9Current*0.997)return false;
+  if(priceNow>ema9Current*1.05)return false; // way above = not actually testing EMA9, different setup
+  const recent=candles1m.slice(-lookback);
+  // Condition 2: at least one candle low has touched within 0.5% of EMA9
+  // (we approximate "EMA9 at that time" with current EMA9 since EMA9 moves slowly)
+  const touched=recent.some(c=>c.low<=ema9Current*1.005&&c.low>=ema9Current*0.995);
+  if(!touched)return false;
+  // Condition 3: all recent closes must be at or above EMA9 (with 0.2% tolerance for noise)
+  const allClosesHeld=recent.every(c=>c.close>=ema9Current*0.998);
+  if(!allClosesHeld)return false;
+  return true;
+}
+
 function calcATR(candles,period=14){
   if(candles.length<2)return 0;
   const trs=candles.slice(-period).map((c,i,a)=>{
@@ -446,9 +474,12 @@ function checkEntry(ticker,s){
     checks.rvol=d.rvol>=(s.qualityMinRvol||15);
     // 4. Catalyst — news with matching keywords in last 24h
     checks.catalyst=!s.qualityRequireCatalyst||d.hasCatalyst===true;
-    // 5. Price > VWAP AND price > EMA9 (must be above both)
+    // 5. Price > VWAP AND respecting EMA9 (either above it OR holding it as support)
     checks.aboveVwap=d.vwap>0&&d.price>d.vwap;
-    checks.aboveEma9=d.ema9>0&&d.price>d.ema9;
+    // EMA9 check: either clearly above EMA9, OR consolidating against it as support.
+    // The "isHoldingEma9" path catches stocks that are coiling above EMA9 making higher
+    // highs and higher lows — which previously got rejected by the strict price > ema9 check.
+    checks.aboveEma9=d.ema9>0&&(d.price>d.ema9||isHoldingEma9(d.candles1m,d.ema9,d.price));
     // 6. 5-min RSI in range 45-68 (computed on 5-min candle closes, not ticks)
     const rsi5m=calcRSI5m(d.candles5m);
     checks.rsi=rsi5m>=(s.qualityRsiMin||45)&&rsi5m<=(s.qualityRsiMax||68);
@@ -502,7 +533,7 @@ function checkEntry(ticker,s){
         rvol:`RVOL ${d.rvol.toFixed(1)}x < ${s.qualityMinRvol}x min`,
         catalyst:"No catalyst (no 📰 news)",
         aboveVwap:`Below VWAP ($${(d.price).toFixed(2)} vs $${(d.vwap||0).toFixed(2)})`,
-        aboveEma9:`Below EMA9 ($${(d.price).toFixed(2)} vs $${(d.ema9||0).toFixed(2)})`,
+        aboveEma9:`Below EMA9 & not holding it as support ($${(d.price).toFixed(2)} vs $${(d.ema9||0).toFixed(2)})`,
         rsi:`5m RSI ${rsi5m.toFixed(0)} outside ${s.qualityRsiMin}-${s.qualityRsiMax}`,
         breakout:`No breakout (price $${d.price.toFixed(2)} ≤ ref $${breakoutLevel.toFixed(2)})`,
         volSurge:"No 1-min vol surge (< 2x avg)",
