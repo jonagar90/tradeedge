@@ -32,9 +32,18 @@ const PROXY = "https://alpaca-proxy.jonagar90.workers.dev";
 
 const DEFAULT_SETTINGS = {
   startingBalance:10000, maxTradeSize:100, dailyLossLimit:200,
-  tpPartialPct:0.5,   // partial exit at +0.5%
-  tpPartialSize:0.4,  // close 40% at partial
-  tpFinalPct:8,       // full exit at +8%
+  // === Three-stage scale-out ===
+  // Stage 1: take initial profit + move SL to breakeven
+  tpPartialPct:3,     // Stage 1 at +3% (was 0.5% — too small, killed winners)
+  tpPartialSize:0.35, // close 35% at Stage 1
+  // Stage 2: lock in profit + move SL to Stage 1 price
+  tpStage2Enabled:true,
+  tpStage2Pct:7,      // Stage 2 at +7%
+  tpStage2Size:0.35,  // close 35% at Stage 2 (leaves 30% runner)
+  // Stage 3 (runner): trail on EMA9, exit on overbought/no-progress/VWAP loss
+  tpFinalPct:25,      // hard cap on runner (was 8% — too tight for winners)
+  runnerNoProgressMins:30,   // exit runner if no new high in N minutes
+  runnerRsiExit:82,          // exit runner on RSI overbought
   slPct:1.5,          // tighter SL
   rvolEntry:5, rvolExit:2,
   gapMinPct:10, priceMin:0.1, priceMax:50,
@@ -61,6 +70,16 @@ const DEFAULT_SETTINGS = {
   intradayBreakoutPct:0.3,     // % above last-hour high to confirm breakout
   intradayAvoidDeadZone:true,  // skip 11:30-1:30 unless RVOL is exceptional
   intradayDeadZoneRvolOverride:15, // RVOL needed to trade during dead zone
+  // --- Premarket scanner (Phase A — watchlist builder, no trading) ---
+  premarketScannerEnabled:true,
+  premarketMinGap:10,            // gap % threshold for adding to watchlist
+  // --- Early Ignition lane (Phase B — first 5 min after open, relaxed criteria) ---
+  // DISABLED BY DEFAULT — high-risk lane. Turn on once Phase A proves valuable.
+  earlyIgnitionEnabled:false,
+  earlyIgnitionWindowMins:5,     // first N minutes after open this lane is active
+  earlyIgnitionMinGap:15,        // higher gap threshold (compensates for relaxed other rules)
+  earlyIgnitionMinRvol:5,        // lower RVOL ok — first minute has limited data
+  earlyIgnitionRsiMax:80,        // wider RSI tolerance for momentum entries
   // --- EOD force-close (capital protection) ---
   eodCloseEnabled:true,
   eodCloseMinsBeforeClose:30,  // close all positions 30 min before 4pm = 3:30pm
@@ -495,6 +514,33 @@ function checkEntry(ticker,s){
     }
   }
 
+  // === ⚡⚡ EARLY IGNITION (first 5 minutes after open, relaxed criteria) ===
+  // Designed to catch parabolic runners in the first 5 minutes when normal indicators (VWAP,
+  // EMA) don't yet have enough data. Higher gap requirement compensates for relaxed other rules.
+  // DISABLED by default — high-risk lane. Lots of false signals possible.
+  if(s.earlyIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.earlyIgnitionWindowMins||5)){
+    const earlyIgnitionPass=
+      d.gapPct>=(s.earlyIgnitionMinGap||15)&&
+      d.rvol>=(s.earlyIgnitionMinRvol||5)&&
+      rsi<=(s.earlyIgnitionRsiMax||80)&&
+      // Must have a prev close (sanity check)
+      d.prevClose>0&&
+      // Must be in price range
+      d.price>=s.priceMin&&d.price<=s.priceMax;
+    if(earlyIgnitionPass){
+      return{
+        pass:true,
+        rsi,
+        rvol:d.rvol,
+        gapPct:d.gapPct,
+        strategy:"EARLY_IGN",
+        score:Math.max(score,75),
+        vwap:d.vwap,
+        ema9:d.ema9
+      };
+    }
+  }
+
   // === MOMENTUM IGNITION EXCEPTION (Aggressive Open Entry) ===
   // Bypass the strict pullback-state requirement for high-conviction setups within the first N minutes.
   // Designed to catch parabolic morning runners that never give a clean pullback.
@@ -628,14 +674,16 @@ function buildTradeReport(trade,tradeIndex){
 
   // Heuristic analysis — auto-flag patterns worth reviewing
   const observations=[];
-  if(isWin&&trade.reason==="TP_FINAL")observations.push("✓ Hit full take-profit target — strong follow-through");
-  if(isWin&&trade.reason==="TP_PARTIAL")observations.push("✓ Captured partial profit; runner stalled before full TP");
+  if(isWin&&trade.reason==="TP_FINAL")observations.push("✓ Hit hard cap target — runner caught a big move");
+  if(isWin&&trade.reason==="TP_PARTIAL")observations.push("✓ Captured Stage 1 profit at +3% — moved SL to breakeven");
   if(trade.reason==="SL")observations.push("✗ Stopped out at hard SL — entry timing or thesis was wrong");
   if(trade.reason==="VWAP_STOP")observations.push("✗ Lost VWAP — momentum failed, exit was protective");
-  if(trade.reason==="EMA9_TRAIL")observations.push("✓ Trailing stop on EMA9 protected partial gains");
+  if(trade.reason==="EMA9_TRAIL")observations.push("✓ Runner trailed on EMA9 — locked in profit on the way down");
   if(trade.reason==="RVOL_FADE")observations.push("△ Volume dried up — exit avoided dead-money hold");
   if(trade.reason==="EOD_CLOSE")observations.push("△ Force-closed at end of day — trade did not resolve naturally");
   if(trade.reason==="MANUAL")observations.push("△ Manually closed by user");
+  if(trade.reason==="RSI_EXIT")observations.push("✓ RSI overbought (≥82) — exited runner before reversal");
+  if(trade.reason==="NO_PROGRESS")observations.push("△ Runner went flat 30+ min without new high — capital opportunity cost");
   if(mfePct>=1.5&&trade.pnlPct<0.3)observations.push(`? MFE was +${mfePct.toFixed(2)}% but exit was only ${trade.pnlPct.toFixed(2)}% — consider tighter trailing stop`);
   if(maePct<=-1&&isWin)observations.push(`? MAE went to ${maePct.toFixed(2)}% before recovering — entry timing could be earlier`);
   if(holdSec<120&&!isWin)observations.push("? Stopped out fast (<2min) — likely chasing or noise entry");
@@ -1026,7 +1074,17 @@ function reducer(state,action){
       const trade=state.openTrades.find(o=>o.id===action.tradeId);
       if(!trade||trade.partialDone)return state;
       const partialPnl=(action.pct/100)*trade.size*(action.closePrice-trade.entry)/trade.entry;
-      return{...state,balance:state.balance+partialPnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{...o,partialDone:true,sl:o.entry,size:o.size*(1-action.sizePct)}:{...o})};
+      // Capture the Stage 1 exit price so Stage 2's new SL can reference it
+      return{...state,balance:state.balance+partialPnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{...o,partialDone:true,sl:o.entry,size:o.size*(1-action.sizePct),stage1Price:action.closePrice}:{...o})};
+    }
+    case"CLOSE_STAGE2":{
+      const trade=state.openTrades.find(o=>o.id===action.tradeId);
+      if(!trade||trade.stage2Done||!trade.partialDone)return state;
+      // P&L for the slice we're closing
+      const stage2Pnl=(action.pct/100)*trade.size*(action.closePrice-trade.entry)/trade.entry;
+      // New SL = Stage 1 exit price (locks in the Stage 1 profit on the runner)
+      const newSl=trade.stage1Price||trade.entry;
+      return{...state,balance:state.balance+stage2Pnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{...o,stage2Done:true,sl:newSl,size:o.size*(1-action.sizePct),stage2Price:action.closePrice}:{...o})};
     }
     case"CLOSE":{
       const{tradeId,closePrice,reason,t}=action;
@@ -1067,6 +1125,10 @@ function App(){
   const [alpacaPositions,setAlpacaPositions]=useState([]);
   const [alpacaErrors,setAlpacaErrors]=useState([]);
   const [alpacaTickers,setAlpacaTickers]=useState([]);
+  // Premarket watchlist — tickers found gapping in premarket (7:00-9:30 AM ET).
+  // These get merged into alpacaTickers so they're prewarmed and ready at the open.
+  // Cleared each day at 4 AM ET (premarket session start) so we don't carry yesterday's stale list.
+  const [premarketWatchlist,setPremarketWatchlist]=useState(new Set());
   const [tickerData,setTickerData]=useState({});
   const [alpacaLastScan,setAlpacaLastScan]=useState(null);
   const [wsStatus,setWsStatus]=useState("off");
@@ -1092,7 +1154,7 @@ function App(){
   const [lastCopiedId,setLastCopiedId]=useState(null);
   const tradesRef=useRef(trades);useEffect(()=>{tradesRef.current=trades;},[trades]);
   const alpacaTickersRef=useRef(alpacaTickers);useEffect(()=>{alpacaTickersRef.current=alpacaTickers;},[alpacaTickers]);
-  const allTickers=useMemo(()=>[...new Set(alpacaTickers)],[alpacaTickers]);
+  const allTickers=useMemo(()=>[...new Set([...alpacaTickers,...premarketWatchlist])],[alpacaTickers,premarketWatchlist]);
   const allTickersRef=useRef(allTickers);useEffect(()=>{allTickersRef.current=allTickers;},[allTickers]);
 
   // Drain module-level dataErrors (from prewarm/avgVol bars failures) into the Alpaca Errors panel
@@ -1199,6 +1261,82 @@ function App(){
     setTickerData(prev=>{const next={...prev};for(const sym of syms)next[sym]={...getMkt(sym)};return next;});
   }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`scan: ${e.message||e}`},...p.slice(0,9)]);}};scan();const id=setInterval(scan,settings.scanIntervalMs);return()=>{cancelled=true;clearInterval(id);};},[connStatus.state,settings.scanIntervalMs]);
 
+  // ============================================================
+  // PREMARKET GAPPER SCANNER — Phase A
+  // Runs 7:00 AM to 9:30 AM ET. Looks for stocks gapping ≥10% with snapshot data
+  // and adds them to premarketWatchlist so they get loaded, prewarmed, and ready when the market opens.
+  // Does NOT trade premarket — purely a watchlist builder.
+  // ============================================================
+  useEffect(()=>{
+    if(connStatus.state!=="connected")return;
+    if(!settings.premarketScannerEnabled)return;
+    let cancelled=false;
+    const premarketScan=async()=>{
+      const{h,m}=getEST();
+      const minOfDay=h*60+m;
+      // Only run between 7:00 AM (420) and 9:30 AM (570) ET
+      if(minOfDay<420||minOfDay>=570)return;
+      try{
+        // Pull a wider net during premarket — top 100 most-actives (vs regular 30)
+        // to catch low-volume premarket gappers that may not be in top-30 by raw volume
+        const actives=await alpaca.getMostActives(credsRef.current,100);
+        if(cancelled||!actives.length)return;
+        const candidateSyms=actives.map(a=>a.symbol).filter(s=>s&&s.length<=5);
+        // Fetch snapshots in batches to get prev close and current price
+        const snaps=await alpaca.getSnapshots(candidateSyms,credsRef.current);
+        if(cancelled)return;
+        const s=settingsRef.current;
+        const minGap=s.premarketMinGap||10;
+        const found=[];
+        for(const sym of candidateSyms){
+          const snap=snaps[sym];
+          if(!snap)continue;
+          const price=snap.latestTrade?.p||snap.minuteBar?.c||0;
+          const prevClose=snap.prevDailyBar?.c||0;
+          if(!price||!prevClose)continue;
+          // Filter by price range (use existing settings — typically $0.5-$50)
+          if(price<s.priceMin||price>s.priceMax)continue;
+          const gapPct=((price-prevClose)/prevClose)*100;
+          if(gapPct<minGap)continue;
+          found.push({sym,gapPct,price,prevClose});
+          // Pre-populate the market data so it's ready at open
+          updateMkt(sym,price,0,prevClose,price);
+        }
+        if(found.length>0){
+          // Add to watchlist — preserves existing watchlist, doesn't replace
+          setPremarketWatchlist(prev=>{
+            const next=new Set(prev);
+            for(const{sym}of found)next.add(sym);
+            return next;
+          });
+          // Log the discovery (only new tickers, not repeats)
+          setScanLog(p=>[{t:nowIso(),ticker:"🌅 PMS",reason:`Found ${found.length} premarket gappers ≥${minGap}%: ${found.slice(0,5).map(f=>`${f.sym}(+${f.gapPct.toFixed(0)}%)`).join(", ")}${found.length>5?"...":""}`},...p.slice(0,49)]);
+        }
+      }catch(e){
+        if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`premarket scan: ${e.message||e}`},...p.slice(0,9)]);
+      }
+    };
+    premarketScan();
+    // Premarket scan every 60s — much slower than regular scan (15s)
+    // because premarket data changes slowly and we want to be gentle on rate limits
+    const id=setInterval(premarketScan,60000);
+    return()=>{cancelled=true;clearInterval(id);};
+  },[connStatus.state,settings.premarketScannerEnabled]);
+
+  // Daily cleanup of premarket watchlist at 4 AM ET (start of premarket session).
+  // Without this, yesterday's gappers stay in the watchlist forever.
+  useEffect(()=>{
+    const checkReset=()=>{
+      const{h,m}=getEST();
+      // Reset watchlist between 4:00 and 4:05 AM ET (premarket session start)
+      if(h===4&&m<5){
+        setPremarketWatchlist(new Set());
+      }
+    };
+    const id=setInterval(checkReset,60000); // check every minute
+    return()=>clearInterval(id);
+  },[]);
+
 
   // WebSocket — event-driven: tickers becoming entry-eligible trigger fire() within 200ms
   // Triggers on CONFIRM transitions AND on plausible IGNITION/INTRADAY conditions, with a 5s
@@ -1221,7 +1359,13 @@ let plausible=false;
 if(cooldownOK&&fireRef.current&&!pendingFireRef.current){
   // CONFIRM transition — original trigger, always honored
   if(enteredConfirm)plausible=true;
-  // QUALITY window check (9:45-10:30am, the strictest A+ setup lane — highest priority)
+  // EARLY IGNITION window check (first 5 min after open, most aggressive)
+  else if(s.earlyIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.earlyIgnitionWindowMins||5)){
+    if(d.gapPct>=(s.earlyIgnitionMinGap||15)&&d.rvol>=(s.earlyIgnitionMinRvol||5)){
+      plausible=true;
+    }
+  }
+  // QUALITY window check (9:45-10:30am, the strictest A+ setup lane)
   else if(s.qualitySetupEnabled&&minsFromOpen>=(s.qualityWindowStartMins||15)&&minsFromOpen<=(s.qualityWindowEndMins||60)){
     // Lightweight pre-check: must be high-RVOL with a catalyst, full check happens in fire()
     if(d.rvol>=(s.qualityMinRvol||15)&&d.hasCatalyst&&d.vwap>0&&p>d.vwap){
@@ -1289,41 +1433,92 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       if(px<(trade.minPrice||trade.entry))trade.minPrice=px;
       const counter=getCounter(trade.ticker);
       const uplPct=((px-trade.entry)/trade.entry)*100;
+      // Track the highest price reached during the runner phase (after Stage 2).
+      // Used to detect "30 min no progress" — if we haven't made a new high in 30 min, exit runner.
+      if(trade.stage2Done){
+        if(!trade.runnerHigh||px>trade.runnerHigh){
+          trade.runnerHigh=px;
+          trade.runnerHighTime=now;
+        }
+      }
 
-      // PHASE 2: Partial profit + move to breakeven
+      // ═══════════════════════════════════════════════════════════════════
+      // STAGE 1: Initial profit take at +3%
+      // Close 35% of position, move SL to breakeven (trade is now "free")
+      // ═══════════════════════════════════════════════════════════════════
       if(!trade.partialDone&&uplPct>=s.tpPartialPct){
         dispatch({type:"CLOSE_PARTIAL",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpPartialSize});
         getMkt(trade.ticker).partialDone=true;
         continue;
       }
 
+      // ═══════════════════════════════════════════════════════════════════
+      // STAGE 2: Lock in profit at +7%
+      // Close another 35% of position, move SL to Stage 1 price (locks gains)
+      // Only fires if Stage 1 already hit
+      // ═══════════════════════════════════════════════════════════════════
+      if(trade.partialDone&&!trade.stage2Done&&s.tpStage2Enabled&&uplPct>=s.tpStage2Pct){
+        dispatch({type:"CLOSE_STAGE2",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpStage2Size});
+        continue;
+      }
+
       let hit=null;
 
-      // Hard TP (runner target)
+      // ═══════════════════════════════════════════════════════════════════
+      // STAGE 3 (RUNNER) — only the remaining ~30% of position lives here
+      // Multiple exit triggers, prioritized:
+      // 1. Hard cap (TP_FINAL) — runner reaches very high target
+      // 2. Stop loss (SL/BE/Stage1) — depends on which stages have hit
+      // 3. RSI exhaustion (RSI > 82) — overbought reversal warning
+      // 4. No-progress timeout (runner) — 30 min without a new high = stale
+      // 5. VWAP stop — soft exit if 3 consecutive ticks below VWAP
+      // 6. EMA9 trail — runner exits if 3 ticks below EMA9 (after Stage 2 only)
+      // 7. RVOL fade — momentum dying off
+      // ═══════════════════════════════════════════════════════════════════
+
+      // (1) Hard cap on runner
       if(px>=trade.entry*(1+s.tpFinalPct/100)){hit="TP_FINAL";resetCounter(trade.ticker);}
 
-      // Hard SL (or breakeven after partial)
+      // (2) Hard SL — but the SL value itself shifted via the reducer at each stage:
+      //     - Before Stage 1: SL = entry × (1 - 1.5%) [original SL]
+      //     - After Stage 1: SL = entry [breakeven]
+      //     - After Stage 2: SL = Stage 1 price [profit locked]
       else if(px<=trade.sl){hit="SL";resetCounter(trade.ticker);}
 
-      // VWAP stop — 3 consecutive ticks below VWAP
-      else if(d.vwap>0&&px<d.vwap*0.998){
+      // (3) RSI exhaustion — only fires on the runner (after Stage 2), when momentum is overheating
+      else if(trade.stage2Done&&calcRSI(d.priceHistory)>=(s.runnerRsiExit||82)){
+        hit="RSI_EXIT";resetCounter(trade.ticker);
+      }
+
+      // (4) Runner no-progress timeout — if we haven't made a new high in N minutes, exit
+      else if(trade.stage2Done&&trade.runnerHighTime){
+        const minsFlat=(now-trade.runnerHighTime)/60000;
+        if(minsFlat>=(s.runnerNoProgressMins||30)){
+          hit="NO_PROGRESS";resetCounter(trade.ticker);
+        }
+      }
+
+      // (5) VWAP stop — 3 consecutive ticks below VWAP. Applies pre-runner too.
+      if(!hit&&d.vwap>0&&px<d.vwap*0.998){
         counter.vwapBelow++;counter.rvolLow=0;counter.redCandles=0;
         if(counter.vwapBelow>=3){hit="VWAP_STOP";resetCounter(trade.ticker);}
       }
 
-      // EMA9 trailing stop — 3 closes below EMA9 after partial
-      else if(trade.partialDone&&d.ema9>0&&px<d.ema9*0.998){
+      // (6) EMA9 trailing stop — 3 closes below EMA9 after Stage 2 (runner only).
+      // Before Stage 2, EMA9 trail is too aggressive — we still want to give the position
+      // room to develop. Once Stage 2 hits, we're protecting profit so tighter trail makes sense.
+      else if(!hit&&trade.stage2Done&&d.ema9>0&&px<d.ema9*0.998){
         counter.redCandles++;
         if(counter.redCandles>=3){hit="EMA9_TRAIL";resetCounter(trade.ticker);}
       }
 
-      // RVOL fade — 5 ticks
-      else if(d.rvol>0&&d.rvol<s.rvolExit){
+      // (7) RVOL fade — momentum dying. 5 ticks of low RVOL.
+      else if(!hit&&d.rvol>0&&d.rvol<s.rvolExit){
         counter.rvolLow++;counter.vwapBelow=0;
         if(counter.rvolLow>=5){hit="RVOL_FADE";resetCounter(trade.ticker);}
       }
 
-      else{resetCounter(trade.ticker);}
+      else if(!hit){resetCounter(trade.ticker);}
 
       if(hit){
         const closePrice=px;
@@ -1653,6 +1848,8 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                           {check.pass?(
                             check.strategy==="QUALITY"
                               ?<span style={{color:"#7CFFB2",fontWeight:700}}>⭐ QUALITY</span>
+                              :check.strategy==="EARLY_IGN"
+                              ?<span style={{color:"#FF3B30",fontWeight:700}}>⚡⚡ EARLY</span>
                               :check.strategy==="IGNITION"
                               ?<span style={{color:"#FF6B35",fontWeight:700}}>🔥 IGNITION</span>
                               :check.strategy==="INTRADAY"
@@ -1718,7 +1915,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
               <table style={S.table}>
                 <thead><tr><th style={S.th}>TIME</th><th style={S.th}>SYM</th><th style={S.thR}>SCORE</th><th style={S.thR}>ENTRY</th><th style={S.thR}>EXIT</th><th style={S.th}>RSN</th><th style={S.thR}>GAP</th><th style={S.thR}>RVOL</th><th style={S.thR}>PNL%</th><th style={S.thR}>PNL$</th><th style={S.thR}>HOLD</th></tr></thead>
                 <tbody>{trades.closedTrades.map(c=>{
-                  const rsnColor=c.reason==="TP_FINAL"||c.reason==="TP_PARTIAL"?"#7CFFB2":c.reason==="MANUAL"||c.reason==="EOD_CLOSE"?"#FFB627":"#FF7A7A";
+                  const rsnColor=c.reason==="TP_FINAL"||c.reason==="TP_PARTIAL"||c.reason==="RSI_EXIT"||(c.reason==="EMA9_TRAIL"&&c.pnl>=0)?"#7CFFB2":c.reason==="MANUAL"||c.reason==="EOD_CLOSE"||c.reason==="NO_PROGRESS"?"#FFB627":"#FF7A7A";
                   return(<tr key={c.id}>
                     <td style={S.td}>{shortTime(c.closedAt)}</td>
                     <td style={S.td}>{c.ticker}{c.aiTrade?" 🤖":""}</td>
@@ -1846,7 +2043,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         </div>
       </section>
 
-      <footer style={S.footer}>selective momentum · max {settings.maxOpenTrades} trades · min score {settings.minScore}/100 · {settings.riskPct}% risk · partial +{settings.tpPartialPct}% → runner to +{settings.tpFinalPct}% · regime: {regimeState}</footer>
+      <footer style={S.footer}>selective momentum · max {settings.maxOpenTrades} trades · min score {settings.minScore}/100 · {settings.riskPct}% risk · 3-stage: +{settings.tpPartialPct}% → +{settings.tpStage2Pct}% → runner +{settings.tpFinalPct}% · regime: {regimeState}</footer>
     </div>
   );
 }
@@ -1919,11 +2116,21 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="PRICE MIN $" value={settings.priceMin} min={0.01} max={50} step={0.1} onChange={v=>set("priceMin",v)}/>
           <NumField label="PRICE MAX $" value={settings.priceMax} min={1} max={1000} step={1} onChange={v=>set("priceMax",v)}/>
         </SettingGroup>
-        <SettingGroup title="EXITS AND RISK">
-          <NumField label="PARTIAL TP %" value={settings.tpPartialPct} min={0.2} max={3} step={0.1} onChange={v=>set("tpPartialPct",v)} help="close 40% here, move SL to breakeven"/>
-          <NumField label="PARTIAL SIZE %" value={settings.tpPartialSize*100} min={10} max={80} step={10} onChange={v=>set("tpPartialSize",v/100)} help="% of position to close at partial TP"/>
-          <NumField label="RUNNER TP %" value={settings.tpFinalPct} min={2} max={30} step={0.5} onChange={v=>set("tpFinalPct",v)} help="full exit for remaining position"/>
-          <NumField label="SL %" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)} help="tighter = better R:R"/>
+        <SettingGroup title="EXITS — 3-STAGE SCALE-OUT">
+          <div style={{fontSize:9,color:"#7CFFB2",marginBottom:6,lineHeight:1.4}}>Stage 1 takes initial profit + moves SL to breakeven. Stage 2 locks in profit + moves SL up. Stage 3 (runner) trails on EMA9 to catch big moves.</div>
+          <NumField label="STAGE 1 TP %" value={settings.tpPartialPct} min={1} max={10} step={0.5} onChange={v=>set("tpPartialPct",v)} help="initial profit take. Default 3% (was 0.5% which was killing winners)."/>
+          <NumField label="STAGE 1 SIZE %" value={settings.tpPartialSize*100} min={10} max={60} step={5} onChange={v=>set("tpPartialSize",v/100)} help="% of position to close at Stage 1. Default 35%."/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:4}}>
+            <input type="checkbox" checked={!!settings.tpStage2Enabled} onChange={e=>set("tpStage2Enabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>STAGE 2 ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Locks in profit at Stage 2 by moving SL to Stage 1's exit price.</div>
+          <NumField label="STAGE 2 TP %" value={settings.tpStage2Pct} min={3} max={20} step={0.5} onChange={v=>set("tpStage2Pct",v)} help="second profit take. Default 7%."/>
+          <NumField label="STAGE 2 SIZE %" value={settings.tpStage2Size*100} min={10} max={60} step={5} onChange={v=>set("tpStage2Size",v/100)} help="% of position to close at Stage 2. Default 35%. Remainder becomes the runner."/>
+          <NumField label="RUNNER HARD CAP %" value={settings.tpFinalPct} min={5} max={100} step={1} onChange={v=>set("tpFinalPct",v)} help="full exit if runner reaches this. Default 25%."/>
+          <NumField label="RUNNER RSI EXIT" value={settings.runnerRsiExit} min={70} max={95} step={1} onChange={v=>set("runnerRsiExit",v)} help="exit runner if RSI overheats. Default 82."/>
+          <NumField label="RUNNER NO-PROGRESS MINS" value={settings.runnerNoProgressMins} min={5} max={120} step={5} onChange={v=>set("runnerNoProgressMins",v)} help="exit runner if N min without new high. Default 30."/>
+          <NumField label="SL %" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)} help="initial stop loss before Stage 1 hits"/>
           <NumField label="RISK PER TRADE %" value={settings.riskPct} min={0.1} max={2} step={0.1} onChange={v=>set("riskPct",v)} help="% of balance risked"/>
           <NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)}/>
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)}/>
@@ -1975,6 +2182,25 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
             <span style={styles.fieldLabel}>AVOID DEAD ZONE (11:30-1:30)</span>
           </label>
           <NumField label="DEAD ZONE RVOL OVERRIDE" value={settings.intradayDeadZoneRvolOverride} min={5} max={50} step={1} onChange={v=>set("intradayDeadZoneRvolOverride",v)} help="RVOL needed to trade during dead zone anyway"/>
+        </SettingGroup>
+        <SettingGroup title="🌅 PREMARKET SCANNER (Phase A)">
+          <div style={{fontSize:9,color:"#7CFFB2",marginBottom:6,lineHeight:1.4}}>Scans 7:00–9:30 AM ET for stocks gapping ≥N%. Adds them to the watchlist so they're prewarmed and ready when the market opens. Does NOT trade premarket.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.premarketScannerEnabled} onChange={e=>set("premarketScannerEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>PREMARKET SCANNER ENABLED</span>
+          </label>
+          <NumField label="MIN GAP %" value={settings.premarketMinGap} min={5} max={50} step={1} onChange={v=>set("premarketMinGap",v)} help="default 10% — wider net catches more"/>
+        </SettingGroup>
+        <SettingGroup title="⚡⚡ EARLY IGNITION (Phase B — risky)">
+          <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>⚠ High-risk lane. Fires in first 5 min after open with relaxed VWAP/EMA requirements. Catches early breakouts but more false signals. Test carefully.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.earlyIgnitionEnabled} onChange={e=>set("earlyIgnitionEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>EARLY IGNITION ENABLED</span>
+          </label>
+          <NumField label="WINDOW (mins from open)" value={settings.earlyIgnitionWindowMins} min={1} max={15} step={1} onChange={v=>set("earlyIgnitionWindowMins",v)} help="default 5 = first 5 min"/>
+          <NumField label="MIN GAP %" value={settings.earlyIgnitionMinGap} min={10} max={50} step={1} onChange={v=>set("earlyIgnitionMinGap",v)} help="default 15% (higher than IGNITION's 12%)"/>
+          <NumField label="MIN RVOL (x)" value={settings.earlyIgnitionMinRvol} min={1} max={50} step={1} onChange={v=>set("earlyIgnitionMinRvol",v)} help="default 5x (lower than IGNITION's 8x — first min has limited data)"/>
+          <NumField label="RSI MAX" value={settings.earlyIgnitionRsiMax} min={60} max={95} step={1} onChange={v=>set("earlyIgnitionRsiMax",v)} help="default 80 — wider tolerance for momentum"/>
         </SettingGroup>
         <SettingGroup title="EOD FORCE-CLOSE">
           <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
