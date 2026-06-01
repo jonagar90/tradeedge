@@ -52,7 +52,10 @@ const DEFAULT_SETTINGS = {
   scanIntervalMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
   gapMomentumEnabled:true, continuationEnabled:false,
   preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
-  cooldownMs:1800000, // 30 min cooldown after SL
+  cooldownMs:1800000, // 30 min cooldown after SL (separate from post-exit cooldown below)
+  // Post-exit cooldown: prevents re-buying a ticker we JUST sold (any reason — TP, SL, RSI_EXIT).
+  // Stops the "exit at peak, re-enter 8 seconds later at the worst price" pattern.
+  postExitCooldownMs:300000, // 5 min default — was the answer to the HCWC re-entry bug
   riskPct:0.5,        // risk 0.5% per trade
   // --- Testing toggles (disable safety brakes to maximize trade volume) ---
   regimeBrakeEnabled:true,  // when false, NO_TRADE/CHOPPY regime never blocks trades
@@ -451,6 +454,15 @@ function checkEntry(ticker,s){
 
   // Cooldown / blacklist (skippable for testing via cooldownEnabled)
   if(s.cooldownEnabled&&now-d.lastSlTime<s.cooldownMs)return{pass:false,reason:`Cooldown — SL hit ${Math.round((now-d.lastSlTime)/60000)}m ago`};
+  // Post-exit cooldown — prevents re-entry immediately after ANY exit on this ticker
+  // (TP, SL, RSI_EXIT, EMA9_TRAIL — all of them). Separate from SL cooldown above.
+  // Always-on safety, not gated by cooldownEnabled testing toggle.
+  const lastExit=(typeof window!=="undefined"&&window.__tradeedgeExitTimes&&window.__tradeedgeExitTimes[ticker])||0;
+  const postExitMs=s.postExitCooldownMs||300000;
+  if(lastExit>0&&now-lastExit<postExitMs){
+    const minsAgo=((now-lastExit)/60000).toFixed(1);
+    return{pass:false,reason:`Post-exit cooldown — closed ${minsAgo}m ago (need ${(postExitMs/60000).toFixed(0)}m)`};
+  }
   if(d.failedBreakouts>=3&&now-d.lastFailTime<1800000)return{pass:false,reason:`Blacklisted — 3 failed breakouts`};
 
   // Score gate
@@ -681,6 +693,12 @@ const exitCounters={};
 const getCounter=t=>{if(!exitCounters[t])exitCounters[t]={vwapBelow:0,rvolLow:0,redCandles:0};return exitCounters[t];};
 const resetCounter=t=>{exitCounters[t]={vwapBelow:0,rvolLow:0,redCandles:0};};
 
+// Per-ticker post-exit cooldown — prevents the bot from immediately re-buying a ticker
+// it just sold. Stamped by the CLOSE reducer; read by checkEntry.
+// Lives on window so the reducer (which runs in a "pure" function context) can write to it
+// without React state machinery.
+if(typeof window!=="undefined"&&!window.__tradeedgeExitTimes)window.__tradeedgeExitTimes={};
+
 /* ================================================================
    TRADE REPORT GENERATOR
    Produces both human-readable text and structured JSON per closed trade.
@@ -738,9 +756,13 @@ ENTRY
 
 EXIT
   Time: ${closeTime} ET  |  Hold: ${holdMin}m ${holdRemSec}s
-  Price: $${fmt(trade.closePrice,2)}
-  P&L: ${trade.pnl>=0?"+":""}$${fmt(trade.pnl,2)} (${fmtPct(trade.pnlPct)})
-  Partial taken: ${trade.partialDone?"YES":"NO"}
+  Final exit price: $${fmt(trade.closePrice,2)}
+  TOTAL P&L: ${trade.pnl>=0?"+":""}$${fmt(trade.pnl,2)} (${fmtPct(trade.pnlPct)})
+
+STAGE BREAKDOWN${(trade.stage1Pnl!==undefined||trade.stage2Pnl!==undefined)?":":" (single exit only — Stage 1/2 didn't fire)"}
+${trade.stage1Pnl!==undefined?`  Stage 1 @ $${fmt(trade.stage1Price,2)}: closed $${fmt(trade.stage1Size||0,2)} → ${trade.stage1Pnl>=0?"+":""}$${fmt(trade.stage1Pnl,2)}`:"  Stage 1: not hit"}
+${trade.stage2Pnl!==undefined?`  Stage 2 @ $${fmt(trade.stage2Price,2)}: closed $${fmt(trade.stage2Size||0,2)} → ${trade.stage2Pnl>=0?"+":""}$${fmt(trade.stage2Pnl,2)}`:"  Stage 2: not hit"}
+  Runner @ $${fmt(trade.closePrice,2)} (${trade.reason}): ${trade.finalSlicePnl>=0?"+":""}$${fmt(trade.finalSlicePnl||trade.pnl,2)}
 
 ENTRY CONDITIONS AT TRIGGER
   RSI: ${ctx.rsi?ctx.rsi.toFixed(0):"—"}  |  RVOL: ${trade.rvol?trade.rvol.toFixed(1)+"x":"—"}
@@ -795,6 +817,24 @@ ${observations.length?observations.map(o=>"  "+o).join("\n"):"  (no notable patt
       price:trade.closePrice,
       holdSeconds:holdSec,
       partialTaken:!!trade.partialDone,
+      stage2Taken:!!trade.stage2Done,
+    },
+    stages:{
+      stage1:trade.stage1Pnl!==undefined?{
+        price:trade.stage1Price,
+        dollarsClosed:trade.stage1Size,
+        pnl:Number((trade.stage1Pnl||0).toFixed(2)),
+      }:null,
+      stage2:trade.stage2Pnl!==undefined?{
+        price:trade.stage2Price,
+        dollarsClosed:trade.stage2Size,
+        pnl:Number((trade.stage2Pnl||0).toFixed(2)),
+      }:null,
+      runner:{
+        price:trade.closePrice,
+        exitReason:trade.reason,
+        pnl:Number((trade.finalSlicePnl||trade.pnl||0).toFixed(2)),
+      },
     },
     conditionsAtEntry:{
       rsi:ctx.rsi,
@@ -1104,28 +1144,71 @@ function reducer(state,action){
     case"CLOSE_PARTIAL":{
       const trade=state.openTrades.find(o=>o.id===action.tradeId);
       if(!trade||trade.partialDone)return state;
-      const partialPnl=(action.pct/100)*trade.size*(action.closePrice-trade.entry)/trade.entry;
-      // Capture the Stage 1 exit price so Stage 2's new SL can reference it
-      return{...state,balance:state.balance+partialPnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{...o,partialDone:true,sl:o.entry,size:o.size*(1-action.sizePct),stage1Price:action.closePrice}:{...o})};
+      // Stage 1 P&L = (dollars closed) × (% price change)
+      // dollars closed = current size × sizePct fraction
+      // % price change = (closePrice - entry) / entry
+      const dollarsClosed=trade.size*action.sizePct;
+      const stage1Pnl=dollarsClosed*((action.closePrice-trade.entry)/trade.entry);
+      return{...state,balance:state.balance+stage1Pnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{
+        ...o,
+        partialDone:true,
+        sl:o.entry,                              // SL → breakeven
+        size:o.size*(1-action.sizePct),          // shrink remaining size
+        stage1Price:action.closePrice,
+        stage1Pnl:stage1Pnl,                     // capture for trade report
+        stage1Size:dollarsClosed,
+        stage1Time:action.t||Date.now(),
+      }:{...o})};
     }
     case"CLOSE_STAGE2":{
       const trade=state.openTrades.find(o=>o.id===action.tradeId);
       if(!trade||trade.stage2Done||!trade.partialDone)return state;
-      // P&L for the slice we're closing
-      const stage2Pnl=(action.pct/100)*trade.size*(action.closePrice-trade.entry)/trade.entry;
-      // New SL = Stage 1 exit price (locks in the Stage 1 profit on the runner)
+      // Same formula — dollars closed × % price change from entry
+      const dollarsClosed=trade.size*action.sizePct;
+      const stage2Pnl=dollarsClosed*((action.closePrice-trade.entry)/trade.entry);
       const newSl=trade.stage1Price||trade.entry;
-      return{...state,balance:state.balance+stage2Pnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{...o,stage2Done:true,sl:newSl,size:o.size*(1-action.sizePct),stage2Price:action.closePrice}:{...o})};
+      return{...state,balance:state.balance+stage2Pnl,openTrades:state.openTrades.map(o=>o.id===action.tradeId?{
+        ...o,
+        stage2Done:true,
+        sl:newSl,                                // SL → Stage 1 price (locks profit)
+        size:o.size*(1-action.sizePct),          // shrink to runner only
+        stage2Price:action.closePrice,
+        stage2Pnl:stage2Pnl,
+        stage2Size:dollarsClosed,
+        stage2Time:action.t||Date.now(),
+      }:{...o})};
     }
     case"CLOSE":{
       const{tradeId,closePrice,reason,t}=action;
       const trade=state.openTrades.find(o=>o.id===tradeId);
       if(!trade)return state;
       const pnlPct=trade.direction==="LONG"?((closePrice-trade.entry)/trade.entry)*100:((trade.entry-closePrice)/trade.entry)*100;
-      const pnl=(pnlPct/100)*trade.size;
-      const assertion={expected:"—",actual:`${pnlPct.toFixed(2)}%`,pass:reason==="TP_FINAL"||reason==="TP_PARTIAL"||reason==="MANUAL"?pnl>0:true};
-      const newBalance=state.balance+pnl;
-      return{...state,balance:newBalance,openTrades:state.openTrades.filter(o=>o.id!==tradeId),closedTrades:[{...trade,closedAt:nowIso(),closePrice,reason,pnl,pnlPct,holdMs:t-new Date(trade.openedAt).getTime(),assertion},...state.closedTrades],equity:[...state.equity,{t,v:newBalance}]};
+      // Final slice P&L (only the runner remaining at this point)
+      const finalSlicePnl=(pnlPct/100)*trade.size;
+      // Total P&L = Stage 1 + Stage 2 + final slice. This makes the journal/report show real totals.
+      const stage1Pnl=trade.stage1Pnl||0;
+      const stage2Pnl=trade.stage2Pnl||0;
+      const totalPnl=stage1Pnl+stage2Pnl+finalSlicePnl;
+      // For reporting: pnlPct on TOTAL trade (weighted across stages, using original entry).
+      // We use the runner's pnlPct as the headline number since that's the "final" trade percentage,
+      // but the JSON report will show per-stage breakdown.
+      const assertion={expected:"—",actual:`${pnlPct.toFixed(2)}%`,pass:reason==="TP_FINAL"||reason==="TP_PARTIAL"||reason==="RSI_EXIT"||reason==="MANUAL"?totalPnl>0:true};
+      const newBalance=state.balance+finalSlicePnl;
+      // Stamp the exit time on lastExitTimes module-level map so we can enforce per-ticker cooldown
+      if(typeof window!=="undefined"&&window.__tradeedgeExitTimes){
+        window.__tradeedgeExitTimes[trade.ticker]=t;
+      }
+      return{...state,balance:newBalance,openTrades:state.openTrades.filter(o=>o.id!==tradeId),closedTrades:[{
+        ...trade,
+        closedAt:nowIso(),
+        closePrice,
+        reason,
+        pnl:totalPnl,          // total P&L including all stages
+        pnlPct,                // headline % (runner's price change vs entry)
+        finalSlicePnl,         // just the runner's P&L
+        holdMs:t-new Date(trade.openedAt).getTime(),
+        assertion,
+      },...state.closedTrades],equity:[...state.equity,{t,v:newBalance}]};
     }
     case"RESET":return{...initialState,equity:[{t:Date.now(),v:STARTING_BALANCE}]};
     default:return state;
@@ -1956,7 +2039,16 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                     <td style={{...S.tdR,color:"#FFB627"}}>{c.gapPct?fmtPct(c.gapPct):"—"}</td>
                     <td style={S.tdR}>{c.rvol?`${c.rvol.toFixed(1)}x`:"—"}</td>
                     <td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{fmtPct(c.pnlPct)}</td>
-                    <td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>{c.pnl>=0?"+":""}{fmt(c.pnl,2)}</td>
+                    <td style={{...S.tdR,color:c.pnl>=0?"#7CFFB2":"#FF7A7A"}}>
+                      <div>{c.pnl>=0?"+":""}${fmt(c.pnl,2)}</div>
+                      {(c.stage1Pnl||c.stage2Pnl)&&(
+                        <div style={{fontSize:9,color:"#7a7a7a",fontWeight:400,marginTop:2,whiteSpace:"nowrap"}}>
+                          {c.stage1Pnl!==undefined?<span>S1: {c.stage1Pnl>=0?"+":""}${fmt(c.stage1Pnl,2)}</span>:null}
+                          {c.stage2Pnl!==undefined?<span> · S2: {c.stage2Pnl>=0?"+":""}${fmt(c.stage2Pnl,2)}</span>:null}
+                          {c.finalSlicePnl!==undefined?<span> · R: {c.finalSlicePnl>=0?"+":""}${fmt(c.finalSlicePnl,2)}</span>:null}
+                        </div>
+                      )}
+                    </td>
                     <td style={S.tdR}>{(c.holdMs/1000).toFixed(0)}s</td>
                   </tr>);
                 })}</tbody>
@@ -2166,6 +2258,7 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)}/>
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)}/>
           <NumField label="COOLDOWN AFTER SL (ms)" value={settings.cooldownMs} min={300000} max={7200000} step={300000} onChange={v=>set("cooldownMs",v)} help="30min default"/>
+          <NumField label="POST-EXIT COOLDOWN (mins)" value={(settings.postExitCooldownMs||300000)/60000} min={1} max={60} step={1} onChange={v=>set("postExitCooldownMs",v*60000)} help="prevents re-entry on a ticker we JUST exited. Default 5 min."/>
         </SettingGroup>
         <SettingGroup title="🧪 TESTING MODE">
           <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>Turn these OFF to maximize trade volume while testing. Turn back ON for real trading.</div>
