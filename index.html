@@ -44,7 +44,16 @@ const DEFAULT_SETTINGS = {
   tpFinalPct:25,      // hard cap on runner (was 8% — too tight for winners)
   runnerNoProgressMins:30,   // exit runner if no new high in N minutes
   runnerRsiExit:82,          // exit runner on RSI overbought
-  slPct:1.5,          // tighter SL
+  slPct:1.5,          // legacy fixed % SL — only used as fallback when structural SL has no data
+  // === Structural Stop-Loss (anchored to VWAP / swing low instead of arbitrary %) ===
+  // Stops "noise stops" — placing SL based on real price action, not a flat percentage.
+  // Recommended: keep enabled. Disable only to A/B test against fixed-% SL.
+  structuralSlEnabled:true,
+  structuralSlVwapBufferPct:0.5,   // SL placed 0.5% below VWAP
+  structuralSlSwingLookback:5,     // look at last 5 1-min candles for swing low
+  structuralSlSwingBufferPct:0.2,  // SL placed 0.2% below swing low
+  structuralSlMaxPct:3,            // hard floor: never more than 3% below entry
+  structuralSlMinPct:0.5,          // hard ceiling: never tighter than 0.5% (avoid spread-eating)
   rvolEntry:5, rvolExit:2,
   gapMinPct:10, priceMin:0.1, priceMax:50,
   minScore:70,        // minimum ticker score to trade
@@ -245,6 +254,53 @@ function isHoldingEma9(candles1m,ema9Current,priceNow,lookback=5){
   const allClosesHeld=recent.every(c=>c.close>=ema9Current*0.998);
   if(!allClosesHeld)return false;
   return true;
+}
+
+/* ================================================================
+   STRUCTURAL STOP-LOSS — anchored to price action, not arbitrary %
+   ================================================================
+   Replaces the fixed -1.5% SL with one based on real structure:
+     - VWAP × (1 - vwapBufferPct/100)         e.g. $0.314 × 0.995 = $0.312
+     - swing low (last N candles)             lowest of last 5 candle lows
+   We use the TIGHTER of those two (closer to entry — more conservative protection)
+   then ENFORCE a hard floor at the maxSlPct cap.
+   Result: tight stops when the structure is tight, wider when the chart shows wider
+   support — but never wider than maxSlPct, so a disaster trade can't blow you up.
+*/
+function calcStructuralSL(entryPrice,vwap,candles1m,opts){
+  const o=opts||{};
+  const vwapBufferPct=o.vwapBufferPct||0.5;   // place SL 0.5% under VWAP
+  const swingLookback=o.swingLookback||5;     // 5 1-min candles
+  const swingBufferPct=o.swingBufferPct||0.2; // place SL 0.2% under swing low
+  const maxSlPct=o.maxSlPct||3;               // never more than 3% below entry
+  const minSlPct=o.minSlPct||0.5;             // never tighter than 0.5% below entry
+  // Floor: never wider than max%
+  const hardFloor=entryPrice*(1-maxSlPct/100);
+  // Ceiling: never tighter than min%
+  const hardCeiling=entryPrice*(1-minSlPct/100);
+  // Compute candidate SLs
+  const candidates=[];
+  if(vwap>0&&vwap<entryPrice){
+    candidates.push(vwap*(1-vwapBufferPct/100));
+  }
+  if(candles1m&&candles1m.length>=swingLookback){
+    const recent=candles1m.slice(-swingLookback);
+    const swingLow=Math.min(...recent.map(c=>c.low));
+    if(swingLow>0&&swingLow<entryPrice){
+      candidates.push(swingLow*(1-swingBufferPct/100));
+    }
+  }
+  // No usable candidates (no VWAP yet, no candles) — fall back to fixed-pct SL at midpoint
+  if(candidates.length===0){
+    const midSlPct=(maxSlPct+minSlPct)/2;
+    return entryPrice*(1-midSlPct/100);
+  }
+  // Use the HIGHER of the candidates (closer to entry = tighter, more conservative)
+  let sl=Math.max(...candidates);
+  // Clamp between hard floor and hard ceiling
+  if(sl<hardFloor)sl=hardFloor;       // never wider than max%
+  if(sl>hardCeiling)sl=hardCeiling;   // never tighter than min%
+  return sl;
 }
 
 function calcATR(candles,period=14){
@@ -1787,18 +1843,34 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           continue;
         }
 
-        // Risk-based position sizing
+        // STOP LOSS — compute FIRST, before sizing, because sizing depends on SL distance.
+        // Structural SL is anchored to VWAP/swing low instead of arbitrary %.
+        let sl;
+        if(s.structuralSlEnabled){
+          sl=calcStructuralSL(px,d.vwap,d.candles1m,{
+            vwapBufferPct:s.structuralSlVwapBufferPct,
+            swingLookback:s.structuralSlSwingLookback,
+            swingBufferPct:s.structuralSlSwingBufferPct,
+            maxSlPct:s.structuralSlMaxPct,
+            minSlPct:s.structuralSlMinPct,
+          });
+        } else {
+          sl=px*(1-(s.slPct/100));
+        }
+        const actualSlPct=((px-sl)/px)*100; // for logging and sizing
+        const tp=px*(1+(s.tpFinalPct/100));
+
+        // Risk-based position sizing — uses ACTUAL SL distance, not the fixed setting.
+        // This guarantees we never risk more than riskPct% of balance per trade,
+        // even when structural SL placed the stop wider than the fixed 1.5%.
         const riskAmt=balance*(s.riskPct/100)*getRegimeMultiplier();
-        const slDist=px*(s.slPct/100);
-        const calcSize=riskAmt/slDist*px;
+        const slDist=px-sl; // dollars per share at risk
+        const calcSize=slDist>0?(riskAmt/slDist)*px:s.maxTradeSize;
         const size=Math.min(calcSize,s.maxTradeSize,balance*0.05);
         if(size<10){
           setScanLog(p=>[{t:nowIso(),ticker,reason:`🔍 Size too small: $${size.toFixed(2)} (need ≥$10)`},...p.slice(0,49)]);
           continue;
         }
-
-        const sl=px*(1-(s.slPct/100));
-        const tp=px*(1+(s.tpFinalPct/100));
 
         setSignals(prev=>[{id:`${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,tpPct:s.tpFinalPct,slPct:s.slPct,size,rvol:d.rvol,gapPct:d.gapPct,rsi:calcRSI(d.priceHistory),vwap:d.vwap,ema9:d.ema9,strategy:check.strategy,score:check.score,rr:((tp-px)/(px-sl)),createdAt:nowIso()},...prev].slice(0,50));
 
@@ -1817,7 +1889,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             else body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
-            setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ ORDER PLACED ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)} (Alpaca ID: ${order.id?.slice(0,8)||"—"})`},...p.slice(0,49)]);
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ ORDER PLACED ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)} · SL $${fmt(sl,2)} (-${actualSlPct.toFixed(2)}%)${s.structuralSlEnabled?" [structural]":""}`},...p.slice(0,49)]);
           }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);setScanLog(p=>[{t:nowIso(),ticker,reason:`❌ ORDER REJECTED: ${e.message||e}`.slice(0,150)},...p.slice(0,49)]);continue;}
         } else {
           setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ SIMULATED ENTRY ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)}`},...p.slice(0,49)]);
@@ -1825,7 +1897,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
         const{minsFromOpen:openMins,h:eh,m:em}=getEST();
         const sessionPosition=openMins<15?"OPEN_15M":openMins<60?"MORNING":openMins<210?"MIDDAY":openMins<360?"AFTERNOON":"LATE_AFTERNOON";
-        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:s.slPct,tpPct:s.tpFinalPct,size,originalSize:size,originalShares:qty,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
+        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:actualSlPct,tpPct:s.tpFinalPct,size,originalSize:size,originalShares:qty,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
           // Rich context for trade reports
           entryContext:{
             rsi:check.rsi,
@@ -2391,7 +2463,17 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="RUNNER HARD CAP %" value={settings.tpFinalPct} min={5} max={100} step={1} onChange={v=>set("tpFinalPct",v)} help="full exit if runner reaches this. Default 25%."/>
           <NumField label="RUNNER RSI EXIT" value={settings.runnerRsiExit} min={70} max={95} step={1} onChange={v=>set("runnerRsiExit",v)} help="exit runner if RSI overheats. Default 82."/>
           <NumField label="RUNNER NO-PROGRESS MINS" value={settings.runnerNoProgressMins} min={5} max={120} step={5} onChange={v=>set("runnerNoProgressMins",v)} help="exit runner if N min without new high. Default 30."/>
-          <NumField label="SL %" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)} help="initial stop loss before Stage 1 hits"/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
+            <input type="checkbox" checked={!!settings.structuralSlEnabled} onChange={e=>set("structuralSlEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>STRUCTURAL SL ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Places SL below VWAP or recent swing low instead of fixed %. Prevents noise stops on volatile small-caps.</div>
+          <NumField label="STRUCTURAL · VWAP BUFFER %" value={settings.structuralSlVwapBufferPct} min={0.1} max={2} step={0.1} onChange={v=>set("structuralSlVwapBufferPct",v)} help="SL placed N% below VWAP. Default 0.5%"/>
+          <NumField label="STRUCTURAL · SWING LOOKBACK" value={settings.structuralSlSwingLookback} min={3} max={20} step={1} onChange={v=>set("structuralSlSwingLookback",v)} help="# of 1-min candles to find swing low. Default 5"/>
+          <NumField label="STRUCTURAL · SWING BUFFER %" value={settings.structuralSlSwingBufferPct} min={0.1} max={2} step={0.1} onChange={v=>set("structuralSlSwingBufferPct",v)} help="SL placed N% below swing low. Default 0.2%"/>
+          <NumField label="STRUCTURAL · MAX SL %" value={settings.structuralSlMaxPct} min={1} max={10} step={0.5} onChange={v=>set("structuralSlMaxPct",v)} help="hard cap — SL never goes wider than this. Default 3%"/>
+          <NumField label="STRUCTURAL · MIN SL %" value={settings.structuralSlMinPct} min={0.2} max={3} step={0.1} onChange={v=>set("structuralSlMinPct",v)} help="hard floor — SL never tighter than this. Default 0.5%"/>
+          <NumField label="LEGACY SL % (only if structural OFF)" value={settings.slPct} min={0.5} max={10} step={0.5} onChange={v=>set("slPct",v)} help="fallback fixed % SL when structural disabled"/>
           <NumField label="RISK PER TRADE %" value={settings.riskPct} min={0.1} max={2} step={0.1} onChange={v=>set("riskPct",v)} help="% of balance risked"/>
           <NumField label="MAX TRADE SIZE $" value={settings.maxTradeSize} min={10} max={100000} step={10} onChange={v=>set("maxTradeSize",v)}/>
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)}/>
