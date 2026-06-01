@@ -1086,7 +1086,68 @@ async function prewarmTicker(sym,creds){
 const aH=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
 async function aGet(path,creds,data=false){const r=await fetch(`${data?`${PROXY}/data`:PROXY}${path}`,{headers:aH(creds)});if(!r.ok){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.json();}
 async function aPost(path,body,creds){const r=await fetch(`${PROXY}${path}`,{method:"POST",headers:aH(creds),body:JSON.stringify(body)});if(!r.ok){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,200)}`);}return r.json();}
-async function closeAlpacaPos(ticker,creds){for(let i=0;i<3;i++){try{const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aH(creds)});if(r.ok||r.status===404)return true;}catch(e){}await new Promise(res=>setTimeout(res,500));}return false;}
+
+// Cancel ALL open/pending orders for a specific ticker.
+// Critical because Alpaca returns 403 ("opposite side order exists") if you try to close
+// a position while a buy/sell order is still pending on the same symbol.
+async function cancelOrdersForTicker(ticker,creds){
+  try{
+    // Get all open orders for this symbol
+    const r=await fetch(`${PROXY}/v2/orders?status=open&symbols=${ticker}`,{headers:aH(creds)});
+    if(!r.ok)return;
+    const orders=await r.json();
+    if(!Array.isArray(orders)||orders.length===0)return;
+    // Cancel each one
+    for(const o of orders){
+      try{
+        await fetch(`${PROXY}/v2/orders/${o.id}`,{method:"DELETE",headers:aH(creds)});
+      }catch(e){/* ignore individual cancel failures */}
+    }
+    // Small delay so Alpaca processes the cancels before we try the next thing
+    await new Promise(r=>setTimeout(r,300));
+  }catch(e){/* non-fatal — if cancel fails, the next operation will surface the error */}
+}
+
+// Fetch the actual position size on Alpaca for a ticker (returns 0 if none).
+// Used to reconcile bot state with broker state before placing partial sells.
+async function getAlpacaPositionQty(ticker,creds){
+  try{
+    const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{headers:aH(creds)});
+    if(r.status===404)return 0;
+    if(!r.ok)return 0;
+    const j=await r.json();
+    return Math.abs(parseInt(j.qty||"0",10))||0;
+  }catch(e){return 0;}
+}
+
+// Place a partial SELL order for a specific share quantity.
+// Used by Stage 1 and Stage 2 to actually move shares off Alpaca, not just bot state.
+// Returns true on success, false on failure (caller decides what to do).
+async function sellAlpacaShares(ticker,qty,creds){
+  if(!qty||qty<1)return false;
+  // Cancel any pending orders first so Alpaca doesn't reject with "opposite order exists"
+  await cancelOrdersForTicker(ticker,creds);
+  try{
+    const body={symbol:ticker,qty:String(qty),side:"sell",type:"market",time_in_force:"day"};
+    const r=await fetch(`${PROXY}/v2/orders`,{method:"POST",headers:aH(creds),body:JSON.stringify(body)});
+    return r.ok;
+  }catch(e){return false;}
+}
+
+async function closeAlpacaPos(ticker,creds){
+  // FIRST: cancel any pending orders on this symbol so Alpaca doesn't reject with "opposite order exists"
+  await cancelOrdersForTicker(ticker,creds);
+  // THEN: close the remaining position via DELETE /v2/positions/{ticker}
+  // This closes whatever quantity is left, even if it differs from what the bot expected.
+  for(let i=0;i<3;i++){
+    try{
+      const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aH(creds)});
+      if(r.ok||r.status===404)return true;
+    }catch(e){}
+    await new Promise(res=>setTimeout(res,500));
+  }
+  return false;
+}
 const alpaca={
   getAccount:c=>aGet("/v2/account",c),
   getPositions:c=>aGet("/v2/positions",c),
@@ -1558,21 +1619,39 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
       // ═══════════════════════════════════════════════════════════════════
       // STAGE 1: Initial profit take at +3%
-      // Close 35% of position, move SL to breakeven (trade is now "free")
+      // Close 35% of position via SELL order, move SL to breakeven
       // ═══════════════════════════════════════════════════════════════════
       if(!trade.partialDone&&uplPct>=s.tpPartialPct){
-        dispatch({type:"CLOSE_PARTIAL",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpPartialSize});
+        // Calculate shares to sell — based on the ORIGINAL share count (before any partials)
+        // because trade.size has been shrunk by previous closes but original shares lived on Alpaca.
+        const originalShares=Math.floor((trade.originalSize||trade.size)/trade.entry);
+        const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpPartialSize));
+        // Send real SELL order to Alpaca (if in alpaca mode)
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current).then(ok=>{
+            if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 1 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
+            else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 1 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+          });
+        }
+        dispatch({type:"CLOSE_PARTIAL",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpPartialSize,sharesSold:sharesToSell});
         getMkt(trade.ticker).partialDone=true;
         continue;
       }
 
       // ═══════════════════════════════════════════════════════════════════
       // STAGE 2: Lock in profit at +7%
-      // Close another 35% of position, move SL to Stage 1 price (locks gains)
-      // Only fires if Stage 1 already hit
+      // Close another 35% of ORIGINAL position via SELL order, SL → Stage 1 price
       // ═══════════════════════════════════════════════════════════════════
       if(trade.partialDone&&!trade.stage2Done&&s.tpStage2Enabled&&uplPct>=s.tpStage2Pct){
-        dispatch({type:"CLOSE_STAGE2",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpStage2Size});
+        const originalShares=Math.floor((trade.originalSize||trade.size)/trade.entry);
+        const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpStage2Size));
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current).then(ok=>{
+            if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 2 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
+            else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 2 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
+          });
+        }
+        dispatch({type:"CLOSE_STAGE2",tradeId:trade.id,closePrice:px,pct:uplPct,sizePct:s.tpStage2Size,sharesSold:sharesToSell});
         continue;
       }
 
@@ -1743,7 +1822,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
         const{minsFromOpen:openMins,h:eh,m:em}=getEST();
         const sessionPosition=openMins<15?"OPEN_15M":openMins<60?"MORNING":openMins<210?"MIDDAY":openMins<360?"AFTERNOON":"LATE_AFTERNOON";
-        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:s.slPct,tpPct:s.tpFinalPct,size,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
+        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:s.slPct,tpPct:s.tpFinalPct,size,originalSize:size,originalShares:qty,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
           // Rich context for trade reports
           entryContext:{
             rsi:check.rsi,
@@ -1887,6 +1966,62 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       </section>
 
       {connStatus.state==="connected"&&alpacaAccount&&<AlpacaAccountCard account={alpacaAccount} positions={alpacaPositions} mode={execMode} errors={alpacaErrors}/>}
+
+      {/* Position Reconciliation — surfaces drift between bot state and Alpaca state */}
+      {connStatus.state==="connected"&&execMode==="alpaca"&&alpacaPositions.length>0&&(()=>{
+        const botTickers=new Set(trades.openTrades.map(t=>t.ticker));
+        const alpacaTickers=new Set(alpacaPositions.map(p=>p.symbol));
+        const orphaned=alpacaPositions.filter(p=>!botTickers.has(p.symbol));
+        if(orphaned.length===0)return null;
+        const totalUnrealized=orphaned.reduce((sum,p)=>sum+Number(p.unrealized_pl||0),0);
+        return(
+          <section style={{...S.card,borderColor:"#FF7A7A",background:"#1a0a0a"}}>
+            <div style={{...S.cardLabel,color:"#FF7A7A"}}>⚠ ALPACA DRIFT — {orphaned.length} ORPHANED POSITION{orphaned.length>1?"S":""}</div>
+            <div style={{fontSize:10,color:"#FFB627",marginTop:4,marginBottom:8,lineHeight:1.5}}>
+              These positions exist on Alpaca but the bot has NO record of them. They're accumulating P&L unmonitored. Likely caused by failed close orders.
+              Unrealized P&L: <span style={{color:totalUnrealized>=0?"#7CFFB2":"#FF7A7A",fontWeight:700}}>{totalUnrealized>=0?"+":""}${fmt(totalUnrealized,2)}</span>
+            </div>
+            <table style={{...S.table,fontSize:11}}>
+              <thead><tr>
+                <th style={S.th}>SYM</th>
+                <th style={S.thR}>QTY</th>
+                <th style={S.thR}>AVG ENTRY</th>
+                <th style={S.thR}>CURRENT</th>
+                <th style={S.thR}>UNREAL P&L</th>
+                <th style={S.th}>ACTION</th>
+              </tr></thead>
+              <tbody>
+                {orphaned.map(p=>{
+                  const pnl=Number(p.unrealized_pl||0);
+                  const pnlPct=Number(p.unrealized_plpc||0)*100;
+                  return(<tr key={p.symbol}>
+                    <td style={S.td}><b>{p.symbol}</b></td>
+                    <td style={S.tdR}>{p.qty}</td>
+                    <td style={S.tdR}>${fmt(Number(p.avg_entry_price),2)}</td>
+                    <td style={S.tdR}>${fmt(Number(p.current_price),2)}</td>
+                    <td style={{...S.tdR,color:pnl>=0?"#7CFFB2":"#FF7A7A"}}>{pnl>=0?"+":""}${fmt(pnl,2)} ({fmtPct(pnlPct)})</td>
+                    <td style={S.td}>
+                      <button onClick={async()=>{
+                        const ok=await closeAlpacaPos(p.symbol,credsRef.current);
+                        if(!ok)setAlpacaErrors(prev=>[{t:Date.now(),msg:`Manual close failed for ${p.symbol}`},...prev.slice(0,9)]);
+                      }} style={{background:"#0d0d0d",border:"1px solid #FF7A7A",color:"#FF7A7A",padding:"2px 8px",fontSize:9,cursor:"pointer",fontFamily:"inherit"}}>FORCE CLOSE</button>
+                    </td>
+                  </tr>);
+                })}
+              </tbody>
+            </table>
+            <div style={{marginTop:10,display:"flex",gap:8,alignItems:"center"}}>
+              <button onClick={async()=>{
+                if(!confirm(`Force-close all ${orphaned.length} orphaned positions on Alpaca? This cancels any pending orders and sells everything.`))return;
+                for(const p of orphaned){
+                  try{await closeAlpacaPos(p.symbol,credsRef.current);}catch(e){}
+                }
+              }} style={{background:"#FF7A7A",border:"none",color:"#000",padding:"6px 12px",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>🚨 PANIC CLOSE ALL ORPHANED</button>
+              <span style={{fontSize:10,color:"#5a5a5a"}}>Cancels pending orders, then liquidates positions Alpaca-side.</span>
+            </div>
+          </section>
+        );
+      })()}
 
       <section style={S.card}>
         <div style={S.cardLabel}>EQUITY CURVE</div>
