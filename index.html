@@ -1803,12 +1803,15 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         setSignals(prev=>[{id:`${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,tpPct:s.tpFinalPct,slPct:s.slPct,size,rvol:d.rvol,gapPct:d.gapPct,rsi:calcRSI(d.priceHistory),vwap:d.vwap,ema9:d.ema9,strategy:check.strategy,score:check.score,rr:((tp-px)/(px-sl)),createdAt:nowIso()},...prev].slice(0,50));
 
         let alpacaOrderId=null;
+        // Compute share quantity up-front — used by both Alpaca orders and the OPEN dispatch
+        // (originalShares field). Must be declared at this scope, not inside the if-block,
+        // or the OPEN dispatch below throws ReferenceError in simulated/disconnected mode.
+        const qty=Math.max(1,Math.floor(size/px));
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
           try{
             // Use whole-share quantity for all orders. Notional/fractional orders are rejected by
             // Alpaca for non-fractionable assets (most small-caps: MNTS, BRTX, etc). Whole-share
             // orders work universally. Slight precision loss (<1% of position size) is acceptable.
-            const qty=Math.max(1,Math.floor(size/px));
             let body;
             if(check.strategy==="PRE")body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day",extended_hours:true};
             else body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
