@@ -1140,6 +1140,40 @@ async function prewarmTicker(sym,creds){
    ALPACA HELPERS
    ================================================================ */
 const aH=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-Type":"application/json"});
+
+// Wait for a market order to fill on Alpaca, return the actual fill price.
+// Polls the order status for up to maxWaitMs. Falls back to the snapshot price if it can't
+// confirm the fill within the window (rare — but in that case the bot's internal state will
+// drift from Alpaca, which the reconciliation panel will surface).
+async function waitForFill(orderId,creds,maxWaitMs=5000){
+  const startTime=Date.now();
+  let attempts=0;
+  while(Date.now()-startTime<maxWaitMs){
+    attempts++;
+    try{
+      const r=await fetch(`${PROXY}/v2/orders/${orderId}`,{headers:aH(creds)});
+      if(r.ok){
+        const order=await r.json();
+        // "filled" = complete fill, "partially_filled" = partial. Either gives us a filled_avg_price.
+        if(order.status==="filled"||order.status==="partially_filled"){
+          const filledPrice=parseFloat(order.filled_avg_price||"0");
+          const filledQty=parseInt(order.filled_qty||"0",10);
+          if(filledPrice>0&&filledQty>0){
+            return{filledPrice,filledQty,status:order.status,attempts};
+          }
+        }
+        // Rejected / canceled — give up
+        if(order.status==="rejected"||order.status==="canceled"||order.status==="expired"){
+          return{filledPrice:0,filledQty:0,status:order.status,attempts};
+        }
+      }
+    }catch(e){/* keep trying */}
+    // Backoff: 200ms, 400ms, 600ms, 800ms, 1000ms, 1000ms...
+    await new Promise(r=>setTimeout(r,Math.min(200*attempts,1000)));
+  }
+  // Timed out — give up, let the caller fall back to snapshot price
+  return{filledPrice:0,filledQty:0,status:"timeout",attempts};
+}
 async function aGet(path,creds,data=false){const r=await fetch(`${data?`${PROXY}/data`:PROXY}${path}`,{headers:aH(creds)});if(!r.ok){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.json();}
 async function aPost(path,body,creds){const r=await fetch(`${PROXY}${path}`,{method:"POST",headers:aH(creds),body:JSON.stringify(body)});if(!r.ok){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,200)}`);}return r.json();}
 
@@ -1837,7 +1871,12 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           setScanLog(p=>[{t:nowIso(),ticker,reason:check.reason},...p.slice(0,49)]);
           continue;
         }
-        const d=getMkt(ticker);const px=d.price;
+        const d=getMkt(ticker);
+        // snapshotPx = price seen when the entry decision was made. We use this to size and
+        // pre-compute SL, but the ACTUAL fill price from Alpaca will replace `px` after the
+        // order fills. Keep snapshotPx around so we can log the slippage.
+        const snapshotPx=d.price;
+        let px=snapshotPx;
         if(!px){
           setScanLog(p=>[{t:nowIso(),ticker,reason:`🔍 No price data (px=${px})`},...p.slice(0,49)]);
           continue;
@@ -1845,6 +1884,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
         // STOP LOSS — compute FIRST, before sizing, because sizing depends on SL distance.
         // Structural SL is anchored to VWAP/swing low instead of arbitrary %.
+        // NOTE: this initial calc uses snapshotPx; after fill we re-calc with the real price.
         let sl;
         if(s.structuralSlEnabled){
           sl=calcStructuralSL(px,d.vwap,d.candles1m,{
@@ -1857,8 +1897,8 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         } else {
           sl=px*(1-(s.slPct/100));
         }
-        const actualSlPct=((px-sl)/px)*100; // for logging and sizing
-        const tp=px*(1+(s.tpFinalPct/100));
+        let actualSlPct=((px-sl)/px)*100;
+        let tp=px*(1+(s.tpFinalPct/100));
 
         // Risk-based position sizing — uses ACTUAL SL distance, not the fixed setting.
         // This guarantees we never risk more than riskPct% of balance per trade,
@@ -1889,7 +1929,44 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             else body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
-            setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ ORDER PLACED ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)} · SL $${fmt(sl,2)} (-${actualSlPct.toFixed(2)}%)${s.structuralSlEnabled?" [structural]":""}`},...p.slice(0,49)]);
+            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            // CRITICAL: poll Alpaca for the ACTUAL fill price (filled_avg_price).
+            // Market orders rarely fill at the snapshot price the bot saw moments ago —
+            // slippage, spread, and order-book depth all shift the fill. Using the
+            // snapshot as our "entry" makes every downstream calculation wrong (SL, TP,
+            // stage triggers, P&L, position size). This wait is non-blocking from the
+            // user's perspective (they don't see the bot pause — the bot is async).
+            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            const fillResult=await waitForFill(order.id,credsRef.current,5000);
+            if(fillResult.filledPrice>0){
+              const slippage=((fillResult.filledPrice-px)/px)*100;
+              // Use the REAL fill price as entry going forward
+              px=fillResult.filledPrice;
+              // Update qty too — partial fills are rare on market orders but possible
+              if(fillResult.filledQty>0&&fillResult.filledQty!==qty){
+                setScanLog(p=>[{t:nowIso(),ticker,reason:`⚠ Partial fill: ${fillResult.filledQty}/${qty} shares`},...p.slice(0,49)]);
+              }
+              setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ FILLED ${check.strategy} ${fillResult.filledQty}sh @ $${fmt(fillResult.filledPrice,4)} (slippage: ${slippage>=0?"+":""}${slippage.toFixed(2)}% vs snapshot $${fmt(snapshotPx,2)})`},...p.slice(0,49)]);
+              // Recompute SL using the REAL fill price as the anchor
+              if(s.structuralSlEnabled){
+                sl=calcStructuralSL(px,d.vwap,d.candles1m,{
+                  vwapBufferPct:s.structuralSlVwapBufferPct,
+                  swingLookback:s.structuralSlSwingLookback,
+                  swingBufferPct:s.structuralSlSwingBufferPct,
+                  maxSlPct:s.structuralSlMaxPct,
+                  minSlPct:s.structuralSlMinPct,
+                });
+              } else {
+                sl=px*(1-(s.slPct/100));
+              }
+              actualSlPct=((px-sl)/px)*100;
+              tp=px*(1+(s.tpFinalPct/100));
+            } else {
+              // Fill didn't confirm within 5s — log a warning. Order may still fill but the
+              // bot's entry price will be the snapshot until reconciliation catches up.
+              setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ ${ticker}: fill not confirmed (status=${fillResult.status}). Entry may drift from Alpaca.`},...p.slice(0,9)]);
+              setScanLog(p=>[{t:nowIso(),ticker,reason:`⚠ ORDER PLACED but fill unconfirmed — using snapshot $${fmt(px,2)} as entry`},...p.slice(0,49)]);
+            }
           }catch(e){setAlpacaErrors(p=>[{t:Date.now(),msg:`order ${ticker}: ${e.message||e}`},...p.slice(0,9)]);setScanLog(p=>[{t:nowIso(),ticker,reason:`❌ ORDER REJECTED: ${e.message||e}`.slice(0,150)},...p.slice(0,49)]);continue;}
         } else {
           setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ SIMULATED ENTRY ${check.strategy} $${size.toFixed(2)} @ $${fmt(px,2)}`},...p.slice(0,49)]);
