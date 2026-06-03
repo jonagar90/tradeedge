@@ -60,7 +60,18 @@ const DEFAULT_SETTINGS = {
   maxOpenTrades:3,    // max 3 concurrent trades
   scanIntervalMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
   gapMomentumEnabled:true, continuationEnabled:false,
-  preMarketEnabled:false, preMarketSlPct:5, preMarketTpPct:8,
+  // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
+  preMarketEnabled:false,        // master toggle, default OFF — opt-in
+  preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
+  preMarketMinGap:15,            // min gap % from prev close (premarket gaps tend to be large)
+  preMarketMinVolume:50000,      // min cumulative premarket SHARES (RVOL is unreliable premarket)
+  preMarketMaxExtPct:8,          // reject if price > N% above premarket VWAP (anti-chasing)
+  preMarketRsiMax:75,            // reject if RSI above this (overbought)
+  preMarketLimitBufferPct:0.5,   // place limit buy this % above current price to improve fill odds
+  preMarketLimitTimeoutSec:90,   // cancel unfilled premarket limit orders after N seconds
+  preMarketMaxPositions:2,       // max concurrent premarket positions (conservative)
+  preMarketSlPct:5,              // wider SL premarket (spreads are wide) — used if structural unavailable
+  preMarketTpPct:8,
   cooldownMs:1800000, // 30 min cooldown after SL (separate from post-exit cooldown below)
   // Post-exit cooldown: prevents re-buying a ticker we JUST sold (any reason — TP, SL, RSI_EXIT).
   // Stops the "exit at peak, re-enter 8 seconds later at the worst price" pattern.
@@ -176,6 +187,11 @@ const getMkt=t=>{
     openingRangeDone:false,
     ema9:0,ema21:0,ema50:0,
     vwapNum:0,vwapDen:0,vwap:0,
+    // Premarket-specific indicators (reset at the open). Regular-session VWAP above mixes
+    // premarket+RTH volume, which is wrong for a premarket strategy — these track premarket alone.
+    pmVwapNum:0,pmVwapDen:0,pmVwap:0,
+    pmHigh:0,pmLow:0,pmVolume:0,pmOpen:0,
+    pmVwapReset:false,    // flips true once we've cleared premarket accumulators at the open
     firstCandleHigh:0,firstCandleLow:0,firstCandleDone:false,
     rvol:0,gapPct:0,
     atr:0,atrHistory:[],
@@ -323,6 +339,24 @@ function updateMkt(ticker,price,volume,prevClose,open){
   if(d.prevClose>0)d.gapPct=((d.open||price)-d.prevClose)/d.prevClose*100;
   if(minsFromOpen<0&&price>d.preMarketHigh)d.preMarketHigh=price;
   if(volume>0){d.vwapNum+=price*volume;d.vwapDen+=volume;d.vwap=d.vwapDen>0?d.vwapNum/d.vwapDen:price;d.volume+=volume;}
+  // ── Premarket-specific indicators (4:00am–9:30am ET) ──────────────────────
+  if(minsFromOpen<0){
+    // Premarket session high/low
+    if(d.pmHigh===0||price>d.pmHigh)d.pmHigh=price;
+    if(d.pmLow===0||price<d.pmLow)d.pmLow=price;
+    if(d.pmOpen===0)d.pmOpen=price; // first premarket print
+    // Premarket VWAP — separate accumulator from regular session
+    if(volume>0){
+      d.pmVwapNum+=price*volume;
+      d.pmVwapDen+=volume;
+      d.pmVwap=d.pmVwapDen>0?d.pmVwapNum/d.pmVwapDen:price;
+      d.pmVolume+=volume;
+    }
+  } else if(!d.pmVwapReset){
+    // At the open, freeze premarket VWAP value but stop accumulating into it.
+    // The regular-session VWAP (d.vwap) takes over from here.
+    d.pmVwapReset=true;
+  }
   // First candle tracking
   if(minsFromOpen===0){if(price>d.firstCandleHigh)d.firstCandleHigh=price;if(d.firstCandleLow===0||price<d.firstCandleLow)d.firstCandleLow=price;}
   if(minsFromOpen===1&&!d.firstCandleDone)d.firstCandleDone=true;
@@ -480,12 +514,31 @@ function checkEntry(ticker,s){
   const now=Date.now();
   const rsi=calcRSI(d.priceHistory);
 
-  // Pre-market
+  // ═══════════════════════════════════════════════════════════════════════
+  // PREMARKET STRATEGY (Option C) — dedicated indicators, limit-order entries
+  // Runs from preMarketStartHour (7am) until the open. Uses premarket VWAP / high / volume
+  // instead of regular-session indicators (which need RTH data to be meaningful).
+  // ═══════════════════════════════════════════════════════════════════════
   if(isPreMarket){
-    if(!s.preMarketEnabled)return{pass:false,reason:"Pre-market disabled"};
-    if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price outside range`};
-    if(d.gapPct<s.gapMinPct)return{pass:false,reason:`Gap ${d.gapPct.toFixed(1)}% < ${s.gapMinPct}%`};
-    return{pass:true,rsi,rvol:d.rvol,gapPct:d.gapPct,strategy:"PRE",score:d.score};
+    if(!s.preMarketEnabled)return{pass:false,reason:"Premarket trading disabled"};
+    // Only trade from the configured start hour (default 7am) — pre-7am is too thin
+    if(h<(s.preMarketStartHour||7))return{pass:false,reason:`Premarket starts ${s.preMarketStartHour||7}am (now ${h}:${String(m).padStart(2,"0")})`};
+    // Price range
+    if(d.price<s.priceMin||d.price>s.priceMax)return{pass:false,reason:`Price $${d.price.toFixed(2)} outside range`};
+    // Gap requirement (premarket gaps tend to be large; higher bar than RTH)
+    if(d.gapPct<(s.preMarketMinGap||15))return{pass:false,reason:`PM gap ${d.gapPct.toFixed(1)}% < ${s.preMarketMinGap||15}%`};
+    // Cumulative premarket volume — absolute shares, since RVOL is unreliable premarket
+    if(d.pmVolume<(s.preMarketMinVolume||50000))return{pass:false,reason:`PM vol ${Math.round(d.pmVolume).toLocaleString()} < ${(s.preMarketMinVolume||50000).toLocaleString()}`};
+    // Must be holding above premarket VWAP (strength)
+    if(d.pmVwap>0&&d.price<d.pmVwap)return{pass:false,reason:`Below PM VWAP ($${d.price.toFixed(2)} vs $${d.pmVwap.toFixed(2)})`};
+    // Not over-extended above premarket VWAP (anti-chasing)
+    const pmExtPct=d.pmVwap>0?((d.price-d.pmVwap)/d.pmVwap)*100:0;
+    if(pmExtPct>(s.preMarketMaxExtPct||8))return{pass:false,reason:`PM ext ${pmExtPct.toFixed(1)}% > ${s.preMarketMaxExtPct||8}% (chasing)`};
+    // RSI not overbought
+    if(rsi>(s.preMarketRsiMax||75))return{pass:false,reason:`PM RSI ${rsi.toFixed(0)} > ${s.preMarketRsiMax||75}`};
+    // Must be near or breaking the premarket high (momentum confirmation), not fading from it
+    if(d.pmHigh>0&&d.price<d.pmHigh*0.97)return{pass:false,reason:`Faded ${(((d.pmHigh-d.price)/d.pmHigh)*100).toFixed(1)}% off PM high`};
+    return{pass:true,rsi,rvol:d.rvol,gapPct:d.gapPct,strategy:"PRE",score:Math.max(d.score,75),vwap:d.pmVwap,ema9:d.ema9,pmExtPct};
   }
 
   if(!isMarketOpen)return{pass:false,reason:"Market closed"};
@@ -1617,13 +1670,20 @@ priceRef.current[sym]=p;setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),pric
 // fire() then runs its full gate sequence including the precise checkEntry() logic.
 const d=getMkt(sym);
 const s=settingsRef.current;
-const{minsFromOpen}=getEST();
+const{minsFromOpen,isPreMarket,h}=getEST();
 const lastAttempt=lastFireAttemptRef.current[sym]||0;
 const cooldownOK=t-lastAttempt>5000; // 5s per-ticker cooldown
 let plausible=false;
 if(cooldownOK&&fireRef.current&&!pendingFireRef.current){
   // CONFIRM transition — original trigger, always honored
   if(enteredConfirm)plausible=true;
+  // PREMARKET check (7:00-9:30 AM ET) — premarket has minsFromOpen < 0
+  else if(s.preMarketEnabled&&isPreMarket&&h>=(s.preMarketStartHour||7)){
+    // Lightweight pre-check: big gap, holding above PM VWAP, enough PM volume. Full check in fire().
+    if(d.gapPct>=(s.preMarketMinGap||15)&&d.pmVwap>0&&p>=d.pmVwap&&d.pmVolume>=(s.preMarketMinVolume||50000)){
+      plausible=true;
+    }
+  }
   // EARLY IGNITION window check (first 5 min after open, most aggressive)
   else if(s.earlyIgnitionEnabled&&minsFromOpen>=0&&minsFromOpen<=(s.earlyIgnitionWindowMins||5)){
     if(d.gapPct>=(s.earlyIgnitionMinGap||15)&&d.rvol>=(s.earlyIgnitionMinRvol||5)){
@@ -1830,10 +1890,13 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       if(settingsRef.current.regimeBrakeEnabled&&regime.current==="NO_TRADE"){setScanLog(p=>[{t:nowIso(),ticker:"ALL",reason:`🚫 NO_TRADE regime (${regime.failureRate.toFixed(0)}% fail rate)`},...p.slice(0,49)]);return;}
       const open=new Set(tradesRef.current.openTrades.map(t=>t.ticker));
       const openCount=tradesRef.current.openTrades.length;
-      if(openCount>=settingsRef.current.maxOpenTrades){return;}
+      const{minsFromOpen,isPreMarket}=getEST();
+      // Premarket uses a tighter position cap (premarket is riskier — thin liquidity, wide spreads).
+      // RTH uses the normal maxOpenTrades.
+      const effectiveMaxOpen=isPreMarket?(settingsRef.current.preMarketMaxPositions||2):settingsRef.current.maxOpenTrades;
+      if(openCount>=effectiveMaxOpen){return;}
       const balance=tradesRef.current.balance;
       const s=settingsRef.current;
-      const{minsFromOpen,isPreMarket}=getEST();
 
       // Score all tickers, sort by score, take top candidates
       const allScored=allTickersRef.current
@@ -1924,9 +1987,15 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             // Use whole-share quantity for all orders. Notional/fractional orders are rejected by
             // Alpaca for non-fractionable assets (most small-caps: MNTS, BRTX, etc). Whole-share
             // orders work universally. Slight precision loss (<1% of position size) is acceptable.
+            // Premarket REQUIRES limit orders with extended_hours — Alpaca rejects market orders
+            // outside RTH. Limit price sits slightly above current price to improve fill odds.
             let body;
-            if(check.strategy==="PRE")body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day",extended_hours:true};
-            else body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
+            if(check.strategy==="PRE"){
+              const limitPrice=+(px*(1+(s.preMarketLimitBufferPct||0.5)/100)).toFixed(2);
+              body={symbol:ticker,qty:String(qty),side:"buy",type:"limit",limit_price:String(limitPrice),time_in_force:"day",extended_hours:true};
+            } else {
+              body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
+            }
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1936,34 +2005,46 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             // snapshot as our "entry" makes every downstream calculation wrong (SL, TP,
             // stage triggers, P&L, position size). This wait is non-blocking from the
             // user's perspective (they don't see the bot pause — the bot is async).
+            // Premarket LIMIT orders may not fill at all — they wait for the market to come
+            // to the price. So premarket gets a longer timeout, and if it doesn't fill we
+            // CANCEL and SKIP rather than recording a phantom position.
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            const fillResult=await waitForFill(order.id,credsRef.current,5000);
+            const isPremarketOrder=check.strategy==="PRE";
+            const fillTimeout=isPremarketOrder?(s.preMarketLimitTimeoutSec||90)*1000:5000;
+            const fillResult=await waitForFill(order.id,credsRef.current,fillTimeout);
             if(fillResult.filledPrice>0){
               const slippage=((fillResult.filledPrice-px)/px)*100;
               // Use the REAL fill price as entry going forward
               px=fillResult.filledPrice;
-              // Update qty too — partial fills are rare on market orders but possible
               if(fillResult.filledQty>0&&fillResult.filledQty!==qty){
                 setScanLog(p=>[{t:nowIso(),ticker,reason:`⚠ Partial fill: ${fillResult.filledQty}/${qty} shares`},...p.slice(0,49)]);
               }
               setScanLog(p=>[{t:nowIso(),ticker,reason:`✅ FILLED ${check.strategy} ${fillResult.filledQty}sh @ $${fmt(fillResult.filledPrice,4)} (slippage: ${slippage>=0?"+":""}${slippage.toFixed(2)}% vs snapshot $${fmt(snapshotPx,2)})`},...p.slice(0,49)]);
-              // Recompute SL using the REAL fill price as the anchor
+              // Recompute SL using the REAL fill price as the anchor.
+              // Premarket uses premarket VWAP for structural SL; RTH uses regular VWAP.
+              const slVwap=isPremarketOrder?(d.pmVwap||d.vwap):d.vwap;
               if(s.structuralSlEnabled){
-                sl=calcStructuralSL(px,d.vwap,d.candles1m,{
+                sl=calcStructuralSL(px,slVwap,d.candles1m,{
                   vwapBufferPct:s.structuralSlVwapBufferPct,
                   swingLookback:s.structuralSlSwingLookback,
                   swingBufferPct:s.structuralSlSwingBufferPct,
-                  maxSlPct:s.structuralSlMaxPct,
+                  maxSlPct:isPremarketOrder?(s.preMarketSlPct||5):s.structuralSlMaxPct,
                   minSlPct:s.structuralSlMinPct,
                 });
               } else {
-                sl=px*(1-(s.slPct/100));
+                sl=px*(1-((isPremarketOrder?s.preMarketSlPct:s.slPct)/100));
               }
               actualSlPct=((px-sl)/px)*100;
               tp=px*(1+(s.tpFinalPct/100));
+            } else if(isPremarketOrder){
+              // Premarket limit order did NOT fill within the timeout — cancel it and SKIP.
+              // Do NOT record a position (the order never filled, so there's nothing to manage).
+              await cancelOrdersForTicker(ticker,credsRef.current);
+              setScanLog(p=>[{t:nowIso(),ticker,reason:`⏳ PM limit unfilled after ${s.preMarketLimitTimeoutSec||90}s — cancelled, skipping`},...p.slice(0,49)]);
+              continue;
             } else {
-              // Fill didn't confirm within 5s — log a warning. Order may still fill but the
-              // bot's entry price will be the snapshot until reconciliation catches up.
+              // RTH market order didn't confirm within 5s — log a warning. Order may still fill
+              // but the bot's entry price will be the snapshot until reconciliation catches up.
               setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ ${ticker}: fill not confirmed (status=${fillResult.status}). Entry may drift from Alpaca.`},...p.slice(0,9)]);
               setScanLog(p=>[{t:nowIso(),ticker,reason:`⚠ ORDER PLACED but fill unconfirmed — using snapshot $${fmt(px,2)} as entry`},...p.slice(0,49)]);
             }
@@ -2249,6 +2330,8 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                           {check.pass?(
                             check.strategy==="QUALITY"
                               ?<span style={{color:"#7CFFB2",fontWeight:700}}>⭐ QUALITY</span>
+                              :check.strategy==="PRE"
+                              ?<span style={{color:"#B47CFF",fontWeight:700}}>🌙 PREMARKET</span>
                               :check.strategy==="EARLY_IGN"
                               ?<span style={{color:"#FF3B30",fontWeight:700}}>⚡⚡ EARLY</span>
                               :check.strategy==="IGNITION"
@@ -2611,6 +2694,22 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
             <span style={styles.fieldLabel}>PREMARKET SCANNER ENABLED</span>
           </label>
           <NumField label="MIN GAP %" value={settings.premarketMinGap} min={5} max={50} step={1} onChange={v=>set("premarketMinGap",v)} help="default 10% — wider net catches more"/>
+        </SettingGroup>
+        <SettingGroup title="🌙 PREMARKET TRADING (Option C — limit orders)">
+          <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>⚠ Trades during premarket (7:00–9:30 AM ET) using LIMIT orders + dedicated premarket indicators (PM VWAP, PM high, PM volume). Thin liquidity & wide spreads — high risk. Limit orders may not fill.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.preMarketEnabled} onChange={e=>set("preMarketEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>PREMARKET TRADING ENABLED</span>
+          </label>
+          <NumField label="START HOUR (ET)" value={settings.preMarketStartHour} min={4} max={9} step={1} onChange={v=>set("preMarketStartHour",v)} help="default 7 = 7:00 AM. Earlier = thinner liquidity."/>
+          <NumField label="MIN GAP %" value={settings.preMarketMinGap} min={5} max={100} step={1} onChange={v=>set("preMarketMinGap",v)} help="default 15%"/>
+          <NumField label="MIN PM VOLUME (shares)" value={settings.preMarketMinVolume} min={1000} max={1000000} step={1000} onChange={v=>set("preMarketMinVolume",v)} help="cumulative premarket shares. Default 50,000. RVOL unreliable PM."/>
+          <NumField label="MAX EXT ABOVE PM VWAP %" value={settings.preMarketMaxExtPct} min={1} max={30} step={1} onChange={v=>set("preMarketMaxExtPct",v)} help="reject if chasing too far above PM VWAP. Default 8%"/>
+          <NumField label="RSI MAX" value={settings.preMarketRsiMax} min={50} max={90} step={1} onChange={v=>set("preMarketRsiMax",v)} help="default 75"/>
+          <NumField label="LIMIT BUFFER %" value={settings.preMarketLimitBufferPct} min={0.1} max={3} step={0.1} onChange={v=>set("preMarketLimitBufferPct",v)} help="place limit buy this % above price to improve fills. Default 0.5%"/>
+          <NumField label="LIMIT TIMEOUT (sec)" value={settings.preMarketLimitTimeoutSec} min={15} max={300} step={15} onChange={v=>set("preMarketLimitTimeoutSec",v)} help="cancel unfilled limit orders after this. Default 90s"/>
+          <NumField label="MAX PM POSITIONS" value={settings.preMarketMaxPositions} min={1} max={3} step={1} onChange={v=>set("preMarketMaxPositions",v)} help="concurrent premarket positions. Default 2 (conservative)"/>
+          <NumField label="PM STOP LOSS %" value={settings.preMarketSlPct} min={1} max={15} step={0.5} onChange={v=>set("preMarketSlPct",v)} help="wider SL for premarket spreads. Default 5%"/>
         </SettingGroup>
         <SettingGroup title="⚡⚡ EARLY IGNITION (Phase B — risky)">
           <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>⚠ High-risk lane. Fires in first 5 min after open with relaxed VWAP/EMA requirements. Catches early breakouts but more false signals. Test carefully.</div>
