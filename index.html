@@ -1201,13 +1201,21 @@ const aH=c=>({"APCA-API-KEY-ID":c.keyId,"APCA-API-SECRET-KEY":c.secret,"Content-
 async function waitForFill(orderId,creds,maxWaitMs=5000){
   const startTime=Date.now();
   let attempts=0;
-  while(Date.now()-startTime<maxWaitMs){
+  // Poll interval scales with the total wait window. Short waits (RTH market orders, 5s)
+  // poll quickly; long waits (premarket limit orders, 90s) poll slowly to conserve API calls.
+  // Rule: aim for ~1 poll every 3 seconds, hard-capped at 12 polls total regardless of window.
+  // This keeps a 90s premarket wait to ~12 calls instead of ~90 — critical for the 200/min limit.
+  const baseInterval=Math.max(3000,Math.floor(maxWaitMs/12));
+  const maxPolls=12;
+  while(Date.now()-startTime<maxWaitMs&&attempts<maxPolls){
     attempts++;
+    let got429=false;
     try{
       const r=await fetch(`${PROXY}/v2/orders/${orderId}`,{headers:aH(creds)});
-      if(r.ok){
+      if(r.status===429){
+        got429=true; // rate limited — back off harder
+      } else if(r.ok){
         const order=await r.json();
-        // "filled" = complete fill, "partially_filled" = partial. Either gives us a filled_avg_price.
         if(order.status==="filled"||order.status==="partially_filled"){
           const filledPrice=parseFloat(order.filled_avg_price||"0");
           const filledQty=parseInt(order.filled_qty||"0",10);
@@ -1215,16 +1223,15 @@ async function waitForFill(orderId,creds,maxWaitMs=5000){
             return{filledPrice,filledQty,status:order.status,attempts};
           }
         }
-        // Rejected / canceled — give up
         if(order.status==="rejected"||order.status==="canceled"||order.status==="expired"){
           return{filledPrice:0,filledQty:0,status:order.status,attempts};
         }
       }
     }catch(e){/* keep trying */}
-    // Backoff: 200ms, 400ms, 600ms, 800ms, 1000ms, 1000ms...
-    await new Promise(r=>setTimeout(r,Math.min(200*attempts,1000)));
+    // Wait before next poll. If we got 429, double the wait to let the limit recover.
+    const wait=got429?baseInterval*2:baseInterval;
+    await new Promise(r=>setTimeout(r,wait));
   }
-  // Timed out — give up, let the caller fall back to snapshot price
   return{filledPrice:0,filledQty:0,status:"timeout",attempts};
 }
 async function aGet(path,creds,data=false){const r=await fetch(`${data?`${PROXY}/data`:PROXY}${path}`,{headers:aH(creds)});if(!r.ok){const t=await r.text().catch(()=>"");throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);}return r.json();}
@@ -1497,7 +1504,7 @@ function App(){
     catch(e){setConnStatus({state:"error",message:String(e.message||e)});setAlpacaAccount(null);}
   };
 
-  useEffect(()=>{if(connStatus.state!=="connected")return;let cancelled=false;const refresh=async()=>{try{const[acct,pos]=await Promise.all([alpaca.getAccount(credsRef.current),alpaca.getPositions(credsRef.current)]);if(cancelled)return;setAlpacaAccount(acct);setAlpacaPositions(pos);}catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`refresh: ${e.message||e}`},...p.slice(0,9)]);}};refresh();const id=setInterval(refresh,10000);return()=>{cancelled=true;clearInterval(id);};},[connStatus.state]);
+  useEffect(()=>{if(connStatus.state!=="connected")return;let cancelled=false;const refresh=async()=>{try{const[acct,pos]=await Promise.all([alpaca.getAccount(credsRef.current),alpaca.getPositions(credsRef.current)]);if(cancelled)return;setAlpacaAccount(acct);setAlpacaPositions(pos);}catch(e){if(!cancelled)setAlpacaErrors(p=>[{t:Date.now(),msg:`refresh: ${e.message||e}`},...p.slice(0,9)]);}};refresh();const id=setInterval(refresh,15000);return()=>{cancelled=true;clearInterval(id);};},[connStatus.state]);
 
   // Alpaca scan
   useEffect(()=>{if(connStatus.state!=="connected")return;let cancelled=false;const scan=async()=>{try{
