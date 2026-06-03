@@ -2197,10 +2197,18 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             <Stat label="WIN RATE" v={`${stats.winRate.toFixed(1)}%`}/><Stat label="AVG R:R" v={stats.avgRR?stats.avgRR.toFixed(2):"—"}/>
             <Stat label="MAX DD" v={`${stats.maxDD.toFixed(2)}%`} bad={stats.maxDD<-3}/><Stat label="AVG HOLD" v={`${stats.avgHoldSec.toFixed(0)}s`}/>
           </div>
-          <div style={{marginTop:10,background:"#060606",border:"1px solid #1a1a1a",padding:"10px 12px",borderRadius:2}}>
-            <div style={S.cardLabel}>DAILY LOSS</div>
-            <div style={{fontSize:16,fontWeight:500,color:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#e8e8e8",marginTop:4}}>-${fmt(dailyLoss,2)} <span style={{fontSize:10,color:"#5a5a5a"}}>/ ${settings.dailyLossLimit}</span></div>
-            <div style={{marginTop:6,height:4,background:"#1a1a1a",borderRadius:2}}><div style={{height:"100%",width:`${Math.min(100,(dailyLoss/settings.dailyLossLimit)*100)}%`,background:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#7CFFB2",borderRadius:2}}/></div>
+          <div style={{marginTop:10,display:"flex",gap:8}}>
+            <div style={{flex:1,background:"#060606",border:"1px solid #1a1a1a",padding:"10px 12px",borderRadius:2}}>
+              <div style={S.cardLabel}>DAILY P&L (NET)</div>
+              <div style={{fontSize:16,fontWeight:500,color:stats.pnl>=0?"#7CFFB2":"#FF7A7A",marginTop:4}}>{stats.pnl>=0?"+":"-"}${fmt(Math.abs(stats.pnl),2)}</div>
+              <div style={{fontSize:9,color:"#5a5a5a",marginTop:2}}>realized across all closed trades</div>
+            </div>
+            <div style={{flex:1,background:"#060606",border:"1px solid #1a1a1a",padding:"10px 12px",borderRadius:2}}>
+              <div style={S.cardLabel}>LOSS BUDGET</div>
+              <div style={{fontSize:16,fontWeight:500,color:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#e8e8e8",marginTop:4}}>-${fmt(dailyLoss,2)} <span style={{fontSize:10,color:"#5a5a5a"}}>/ ${settings.dailyLossLimit}</span></div>
+              <div style={{marginTop:6,height:4,background:"#1a1a1a",borderRadius:2}}><div style={{height:"100%",width:`${Math.min(100,(dailyLoss/settings.dailyLossLimit)*100)}%`,background:circuitBreaker?"#FF7A7A":dailyLoss>settings.dailyLossLimit*0.7?"#FFB627":"#7CFFB2",borderRadius:2}}/></div>
+              <div style={{fontSize:9,color:"#5a5a5a",marginTop:4}}>halts trading at limit (losses only)</div>
+            </div>
           </div>
         </div>
       </section>
