@@ -60,6 +60,9 @@ const DEFAULT_SETTINGS = {
   maxOpenTrades:3,    // max 3 concurrent trades
   scanIntervalMs:15000, mostActivesCount:30, assertTolerancePct:0.5,
   gapMomentumEnabled:true, continuationEnabled:false,
+  // Data feed: "iex" = free (partial, stale on thin penny stocks) | "sip" = Algo Trader Plus
+  // ($99/mo, consolidated tape = real prices on penny stocks). Flip to "sip" AFTER subscribing.
+  dataFeed:"iex",
   // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
   preMarketEnabled:false,        // master toggle, default OFF — opt-in
   preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
@@ -1304,11 +1307,14 @@ async function closeAlpacaPos(ticker,creds){
   }
   return false;
 }
+// Module-level data feed selector, kept in sync with settings.dataFeed by a useEffect below.
+// "iex" = free partial feed; "sip" = paid Algo Trader Plus consolidated feed.
+let DATA_FEED="iex";
 const alpaca={
   getAccount:c=>aGet("/v2/account",c),
   getPositions:c=>aGet("/v2/positions",c),
   getMostActives:async(c,n=30)=>{for(const p of[`/v1beta1/screener/stocks/most-actives?by=volume&top=${n}`,`/v2/stocks/most-actives?by=volume&top=${n}`]){try{const r=await aGet(p,c,true);const l=r?.most_actives||r?.stocks||[];if(l.length>0)return l;}catch(e){}}return[];},
-  getSnapshots:async(syms,c)=>{if(!syms.length)return{};const result={};for(let i=0;i<syms.length;i+=50){try{const r=await aGet(`/v2/stocks/snapshots?symbols=${syms.slice(i,i+50).join(",")}&feed=iex`,c,true);Object.assign(result,r||{});}catch(e){}}return result;},
+  getSnapshots:async(syms,c)=>{if(!syms.length)return{};const result={};for(let i=0;i<syms.length;i+=50){try{const r=await aGet(`/v2/stocks/snapshots?symbols=${syms.slice(i,i+50).join(",")}&feed=${DATA_FEED}`,c,true);Object.assign(result,r||{});}catch(e){}}return result;},
   // Fetches daily bars for the last `days` trading days for a single ticker.
   // Returns array of {v: volume, c: close} or empty array on failure.
   getDailyBars:async(sym,c,days=25)=>{
@@ -1317,7 +1323,7 @@ const alpaca={
       const startDate=new Date(Date.now()-35*86400000);
       const start=startDate.toISOString().split("T")[0];
       const end=endDate.toISOString().split("T")[0];
-      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=iex&adjustment=raw`,c,true);
+      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Day&start=${start}&end=${end}&limit=${days}&feed=${DATA_FEED}&adjustment=raw`,c,true);
       const bars=r?.bars||[];
       if(!bars.length)reportDataError(`${sym}: dailyBars returned empty`);
       return bars;
@@ -1336,7 +1342,7 @@ const alpaca={
       const start=startDate.toISOString();
       const end=endDate.toISOString();
       // limit=50 + sort=desc gets the 50 most recent bars (yesterday's last hour + today so far)
-      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=iex&adjustment=raw&sort=desc`,c,true);
+      const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=${DATA_FEED}&adjustment=raw&sort=desc`,c,true);
       // Reverse to chronological order so EMA/RSI calcs process them in order
       const bars=(r?.bars||[]).slice().reverse();
       if(!bars.length)reportDataError(`${sym}: minuteBars returned empty (48h window)`);
@@ -1467,7 +1473,7 @@ function App(){
   const [dailyLoss,setDailyLoss]=useState(0);
   const [stale,setStale]=useState(false);
 
-  const settingsRef=useRef(settings);useEffect(()=>{settingsRef.current=settings;},[settings]);
+  const settingsRef=useRef(settings);useEffect(()=>{settingsRef.current=settings;DATA_FEED=settings.dataFeed||"iex";},[settings]);
   const credsRef=useRef(creds);useEffect(()=>{credsRef.current=creds;},[creds]);
   const modeRef=useRef(execMode);useEffect(()=>{modeRef.current=execMode;},[execMode]);
   const priceRef=useRef({});
@@ -1674,7 +1680,7 @@ function App(){
   // per-ticker cooldown so a flood of ticks doesn't fire repeatedly for the same setup.
   const lastFireAttemptRef=useRef({});
   const qualityDiagCounter=useRef(0);
-  useEffect(()=>{if(connStatus.state!=="connected"||!allTickers.length)return;let ws=null,reconnectTimer=null;const connect=()=>{setWsStatus("connecting");try{ws=new WebSocket("wss://stream.data.alpaca.markets/v2/iex");ws.onopen=()=>ws.send(JSON.stringify({action:"auth",key:credsRef.current.keyId,secret:credsRef.current.secret}));ws.onmessage=(e)=>{try{const msgs=JSON.parse(e.data);for(const msg of msgs){if(msg.T==="success"&&msg.msg==="authenticated"){setWsStatus("live");ws.send(JSON.stringify({action:"subscribe",trades:allTickersRef.current.slice(0,100)}));}if(msg.T==="t"&&msg.S&&msg.p){const sym=msg.S,p=msg.p,v=msg.s||0,t=Date.now();
+  useEffect(()=>{if(connStatus.state!=="connected"||!allTickers.length)return;let ws=null,reconnectTimer=null;const connect=()=>{setWsStatus("connecting");try{ws=new WebSocket(`wss://stream.data.alpaca.markets/v2/${settingsRef.current.dataFeed||"iex"}`);ws.onopen=()=>ws.send(JSON.stringify({action:"auth",key:credsRef.current.keyId,secret:credsRef.current.secret}));ws.onmessage=(e)=>{try{const msgs=JSON.parse(e.data);for(const msg of msgs){if(msg.T==="success"&&msg.msg==="authenticated"){setWsStatus("live");ws.send(JSON.stringify({action:"subscribe",trades:allTickersRef.current.slice(0,100)}));}if(msg.T==="t"&&msg.S&&msg.p){const sym=msg.S,p=msg.p,v=msg.s||0,t=Date.now();
 const enteredConfirm=updateMkt(sym,p,v);
 priceRef.current[sym]=p;setTickerData(prev=>({...prev,[sym]:{...getMkt(sym),price:p}}));
 
@@ -1730,7 +1736,7 @@ if(plausible){
 }
 
 const openSymbols=new Set(tradesRef.current.openTrades.map(o=>o.ticker));if(openSymbols.has(sym)){setPriceSeries(prev=>{const arr=prev[sym]||[];const next=[...arr,{t,p}].filter(x=>x.t>=t-3600000);// 1h rolling window
-return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("error");ws.onclose=()=>{setWsStatus("reconnecting");reconnectTimer=setTimeout(connect,2000);};}catch(e){setWsStatus("error");reconnectTimer=setTimeout(connect,3000);}};connect();return()=>{clearTimeout(reconnectTimer);try{if(ws)ws.close();}catch(e){}setWsStatus("off");};},[connStatus.state,allTickers.length]);
+return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("error");ws.onclose=()=>{setWsStatus("reconnecting");reconnectTimer=setTimeout(connect,2000);};}catch(e){setWsStatus("error");reconnectTimer=setTimeout(connect,3000);}};connect();return()=>{clearTimeout(reconnectTimer);try{if(ws)ws.close();}catch(e){}setWsStatus("off");};},[connStatus.state,allTickers.length,settings.dataFeed]);
 
   // Data staleness — if no Alpaca scan in 2x scan interval, mark stale
   useEffect(()=>{const id=setInterval(()=>{if(!alpacaLastScan){setStale(false);return;}const age=Date.now()-new Date(alpacaLastScan).getTime();setStale(age>settingsRef.current.scanIntervalMs*2);},2000);return()=>clearInterval(id);},[alpacaLastScan]);
@@ -2030,6 +2036,11 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             } else {
               body={symbol:ticker,qty:String(qty),side:"buy",type:"market",time_in_force:"day"};
             }
+            // Cancel any leftover/pending orders on this symbol FIRST. A stale order from a
+            // previous attempt (or a prior position's order) causes Alpaca to reject the new buy
+            // with 403 "opposite side market/stop order exists" — which is exactly what blocked
+            // the SELX entry. Clearing first lets the legitimate entry go through.
+            await cancelOrdersForTicker(ticker,credsRef.current);
             const order=await aPost("/v2/orders",body,credsRef.current);
             alpacaOrderId=order.id;
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2650,6 +2661,14 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
             <button onClick={()=>onModeChange("simulated")} style={{...styles.modeBtn,...(execMode==="simulated"?styles.modeBtnActive:{})}}>SIMULATED<div style={styles.modeBtnSub}>local paper only</div></button>
             <button onClick={()=>onModeChange("alpaca")} style={{...styles.modeBtn,...(execMode==="alpaca"?styles.modeBtnActiveAlpaca:{})}}>ALPACA PAPER<div style={styles.modeBtnSub}>real orders</div></button>
           </div>
+        </div>}
+        {connStatus.state==="connected"&&<div style={{marginTop:12}}>
+          <div style={styles.fieldLabel}>DATA FEED</div>
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <button onClick={()=>onChange({...settings,dataFeed:"iex"})} style={{...styles.modeBtn,...(settings.dataFeed==="iex"?styles.modeBtnActive:{})}}>IEX<div style={styles.modeBtnSub}>free · partial · stale on pennies</div></button>
+            <button onClick={()=>onChange({...settings,dataFeed:"sip"})} style={{...styles.modeBtn,...(settings.dataFeed==="sip"?styles.modeBtnActiveAlpaca:{})}}>SIP<div style={styles.modeBtnSub}>Algo Trader Plus $99/mo · real</div></button>
+          </div>
+          <div style={{fontSize:9,color:"#FFB627",marginTop:6,lineHeight:1.4}}>⚠ Only switch to SIP AFTER subscribing to Algo Trader Plus in your Alpaca dashboard. Selecting SIP without the subscription will cause data errors.</div>
         </div>}
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:14}}>
