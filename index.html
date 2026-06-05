@@ -1861,7 +1861,11 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       }
 
       // (5) VWAP stop — 3 consecutive ticks below VWAP. Applies pre-runner too.
-      if(!hit&&d.vwap>0&&px<d.vwap*0.998){
+      // CRITICAL: only applies if the trade ENTERED above VWAP. If you entered below VWAP
+      // (e.g. a dip-buy scalp where VWAP sits high from an earlier premarket spike), VWAP was
+      // never your support — so "losing" it is meaningless and would kick the runner out instantly,
+      // before it can run. Those trades rely on structural SL + EMA trail instead.
+      if(!hit&&trade.enteredAboveVwap&&d.vwap>0&&px<d.vwap*0.998){
         counter.vwapBelow++;counter.rvolLow=0;counter.redCandles=0;
         if(counter.vwapBelow>=3){hit="VWAP_STOP";resetCounter(trade.ticker);}
       }
@@ -2111,7 +2115,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
         const{minsFromOpen:openMins,h:eh,m:em}=getEST();
         const sessionPosition=openMins<15?"OPEN_15M":openMins<60?"MORNING":openMins<210?"MIDDAY":openMins<360?"AFTERNOON":"LATE_AFTERNOON";
-        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:actualSlPct,tpPct:s.tpFinalPct,size,originalSize:size,originalShares:qty,vwap:d.vwap,ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
+        dispatch({type:"OPEN",trade:{id:`t-${ticker}-${Date.now()}`,ticker,direction:"LONG",entry:px,tp,sl,slPct:actualSlPct,tpPct:s.tpFinalPct,size,originalSize:size,originalShares:qty,vwap:d.vwap,enteredAboveVwap:(d.vwap>0&&px>=d.vwap),ema9:d.ema9,rvol:d.rvol,gapPct:d.gapPct,strategy:check.strategy,score:check.score,openedAt:nowIso(),openPrice:px,partialDone:false,alpacaOrderId,
           // Rich context for trade reports
           entryContext:{
             rsi:check.rsi,
