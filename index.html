@@ -1337,7 +1337,13 @@ const alpaca={
   // (premarket-only windows return empty on the free IEX feed).
   getRecentMinuteBars:async(sym,c,limit=50)=>{
     try{
-      const endDate=new Date();
+      // SIP historical REST blocks the most-recent ~15 min ("recent SIP data" restriction).
+      // Pull the window ending 16 min ago to stay clear (clock-skew safe). Real-time prices
+      // come from the WebSocket stream, which has separate entitlement — these bars are only
+      // for warming up EMA/RSI, so a 16-min lag on the warmup is harmless.
+      // IEX has no such restriction, so it can end at "now".
+      const sipLagMs=(DATA_FEED==="sip")?16*60*1000:0;
+      const endDate=new Date(Date.now()-sipLagMs);
       const startDate=new Date(Date.now()-48*60*60*1000);
       const start=startDate.toISOString();
       const end=endDate.toISOString();
