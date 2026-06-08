@@ -1351,7 +1351,10 @@ const alpaca={
       const r=await aGet(`/v2/stocks/${sym}/bars?timeframe=1Min&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}&feed=${DATA_FEED}&adjustment=raw&sort=desc`,c,true);
       // Reverse to chronological order so EMA/RSI calcs process them in order
       const bars=(r?.bars||[]).slice().reverse();
-      if(!bars.length)reportDataError(`${sym}: minuteBars returned empty (48h window)`);
+      // Empty warmup bars are NOT a real error — thin/halted tickers may have no bars in the
+      // window, and live prices still come from the WebSocket. Log quietly to console only,
+      // don't spam the Alpaca Errors panel (which is for real failures the user must act on).
+      if(!bars.length)console.debug(`${sym}: minuteBars empty (48h window) — using WS prices`);
       return bars;
     }catch(e){
       reportDataError(`${sym}: minuteBars failed — ${e.message||e}`);
@@ -1987,10 +1990,20 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
           const sorted=[...recentCloses].sort((a,b)=>a-b);
           const medianClose=sorted[Math.floor(sorted.length/2)];
           const divergence=Math.abs((px-medianClose)/medianClose)*100;
-          // Wider tolerance premarket (more volatile) but still catches the $2.13->$2.56 (20%) case
-          const maxDivergencePct=isPreMarket?12:8;
-          if(divergence>maxDivergencePct){
-            setScanLog(p=>[{t:nowIso(),ticker,reason:`🚫 Phantom-print guard: $${px.toFixed(2)} is ${divergence.toFixed(0)}% off recent median $${medianClose.toFixed(2)} — bad tick, skipping`},...p.slice(0,49)]);
+          const onSip=(DATA_FEED==="sip");
+          // SIP is the consolidated tape — real prints are trustworthy, so we tolerate much larger
+          // jumps (real verticals like RMSG/FOXX move 15-25% in a candle). The tell for a TRUE
+          // phantom on SIP is a big price jump with NO volume behind it. So on SIP we only reject
+          // when the jump is large AND the recent candle volume is negligible.
+          // On IEX (partial/stale feed), keep the original tight thresholds — phantoms are common.
+          const maxDivergencePct=onSip?(isPreMarket?30:25):(isPreMarket?12:8);
+          // Volume confirmation: is the latest candle backed by real volume?
+          const lastVol=(d.candles1m&&d.candles1m.length)?(d.candles1m[d.candles1m.length-1].volume||0):0;
+          const volumeConfirmed=lastVol>0;
+          // On SIP, a large divergence WITH volume is a real move — let it through.
+          const isPhantom=divergence>maxDivergencePct&&(!onSip||!volumeConfirmed);
+          if(isPhantom){
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`🚫 Phantom-print guard: $${px.toFixed(2)} is ${divergence.toFixed(0)}% off recent median $${medianClose.toFixed(2)}${onSip?" w/ no volume":""} — bad tick, skipping`},...p.slice(0,49)]);
             continue;
           }
         }
