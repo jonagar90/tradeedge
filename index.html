@@ -1322,24 +1322,79 @@ async function getAlpacaPositionQty(ticker,creds){
   }catch(e){return 0;}
 }
 
+// Returns true if we're currently in extended hours (premarket or afterhours), when Alpaca
+// rejects market orders and only accepts limit orders with extended_hours:true.
+function inExtendedHours(){
+  try{
+    const {isMarketOpen,isPreMarket}=getEST();
+    // Extended hours = any time we're not in the regular cash session.
+    // Premarket is explicitly flagged; afterhours = market not open and not premarket.
+    if(isPreMarket)return true;
+    if(!isMarketOpen)return true; // covers afterhours and overnight
+    return false;
+  }catch(e){return false;}
+}
+
+// Builds a SELL order body that works in BOTH regular and extended hours.
+// RTH: simple market order (fast, guaranteed). Extended hours: marketable LIMIT order priced
+// AGGRESSIVELY BELOW the current price (so it crosses the spread and fills immediately) with
+// extended_hours:true. A market sell premarket gets a 422 rejection — which would mean a
+// stop-loss that silently fails to execute. This is the #1 live-money risk, so exits must
+// always use the order type Alpaca will accept for the current session.
+function buildSellBody(ticker,qty,curPrice){
+  const ext=inExtendedHours();
+  if(ext&&curPrice>0){
+    // Price the limit 2% BELOW current so it's marketable (fills against the bid immediately).
+    // We're exiting — getting out matters more than an extra fraction of a cent.
+    const limitPrice=+(curPrice*0.98).toFixed(curPrice<1?4:2);
+    return{symbol:ticker,qty:String(qty),side:"sell",type:"limit",limit_price:String(limitPrice),time_in_force:"day",extended_hours:true};
+  }
+  return{symbol:ticker,qty:String(qty),side:"sell",type:"market",time_in_force:"day"};
+}
+
 // Place a partial SELL order for a specific share quantity.
 // Used by Stage 1 and Stage 2 to actually move shares off Alpaca, not just bot state.
 // Returns true on success, false on failure (caller decides what to do).
-async function sellAlpacaShares(ticker,qty,creds){
+async function sellAlpacaShares(ticker,qty,creds,curPrice){
   if(!qty||qty<1)return false;
   // Cancel any pending orders first so Alpaca doesn't reject with "opposite order exists"
   await cancelOrdersForTicker(ticker,creds);
   try{
-    const body={symbol:ticker,qty:String(qty),side:"sell",type:"market",time_in_force:"day"};
+    const body=buildSellBody(ticker,qty,curPrice);
     const r=await fetch(`${PROXY}/v2/orders`,{method:"POST",headers:aH(creds),body:JSON.stringify(body)});
     return r.ok;
   }catch(e){return false;}
 }
 
-async function closeAlpacaPos(ticker,creds){
+async function closeAlpacaPos(ticker,creds,curPrice){
   // FIRST: cancel any pending orders on this symbol so Alpaca doesn't reject with "opposite order exists"
   await cancelOrdersForTicker(ticker,creds);
-  // THEN: close the remaining position via DELETE /v2/positions/{ticker}
+  // Extended hours: DELETE /v2/positions sends a MARKET order, which Alpaca rejects premarket (422).
+  // So in extended hours we must place an explicit extended-hours LIMIT sell for the full position.
+  if(inExtendedHours()&&curPrice>0){
+    try{
+      // Find out how many shares we actually hold
+      const posR=await fetch(`${PROXY}/v2/positions/${ticker}`,{headers:aH(creds)});
+      if(posR.ok){
+        const pos=await posR.json();
+        const qty=Math.abs(parseInt(pos.qty||"0",10));
+        if(qty>0){
+          const body=buildSellBody(ticker,qty,curPrice);
+          for(let i=0;i<3;i++){
+            try{
+              const r=await fetch(`${PROXY}/v2/orders`,{method:"POST",headers:aH(creds),body:JSON.stringify(body)});
+              if(r.ok)return true;
+            }catch(e){}
+            await new Promise(res=>setTimeout(res,500));
+          }
+        }
+      } else if(posR.status===404){
+        return true; // no position to close
+      }
+    }catch(e){}
+    // fall through to DELETE attempt as a last resort
+  }
+  // THEN (RTH, or extended-hours fallback): close the remaining position via DELETE /v2/positions/{ticker}
   // This closes whatever quantity is left, even if it differs from what the bot expected.
   for(let i=0;i<3;i++){
     try{
@@ -1810,7 +1865,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       // EOD force-close — highest priority, overrides min-hold and everything else
       if(isEodWindow){
         const closePrice=px;
-        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed EOD close ${trade.ticker}`},...p.slice(0,9)]);});
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed EOD close ${trade.ticker}`},...p.slice(0,9)]);});
         const isLoss=closePrice<trade.entry;
         if(isLoss){
           const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
@@ -1849,7 +1904,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpPartialSize));
         // Send real SELL order to Alpaca (if in alpaca mode)
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current).then(ok=>{
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(ok=>{
             if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 1 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
             else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 1 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
           });
@@ -1867,7 +1922,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         const originalShares=Math.floor((trade.originalSize||trade.size)/trade.entry);
         const sharesToSell=Math.max(1,Math.floor(originalShares*s.tpStage2Size));
         if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current).then(ok=>{
+          sellAlpacaShares(trade.ticker,sharesToSell,credsRef.current,px).then(ok=>{
             if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`Stage 2 sell failed for ${trade.ticker} (${sharesToSell} shares)`},...p.slice(0,9)]);
             else setScanLog(p=>[{t:nowIso(),ticker:trade.ticker,reason:`✅ Stage 2 SOLD ${sharesToSell} shares @ ~$${px.toFixed(2)}`},...p.slice(0,49)]);
           });
@@ -1940,7 +1995,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
       if(hit){
         const closePrice=px;
-        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
         const isLoss=closePrice<trade.entry;
         if(isLoss){
           const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
@@ -2142,7 +2197,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
               if(Math.abs(slippage)>15){
                 setScanLog(p=>[{t:nowIso(),ticker,reason:`🚫 Phantom fill $${fmt(fillResult.filledPrice,2)} vs snapshot $${fmt(snapshotPx,2)} (${slippage.toFixed(0)}%) — closing & skipping`},...p.slice(0,49)]);
                 if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
-                  closeAlpacaPos(ticker,credsRef.current).catch(()=>{});
+                  closeAlpacaPos(ticker,credsRef.current,(priceRef.current[ticker]||snapshotPx)).catch(()=>{});
                 }
                 continue;
               }
@@ -2223,7 +2278,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
   const manualClose=(trade)=>{
     const px=priceRef.current[trade.ticker]??trade.entry;
     resetCounter(trade.ticker);
-    if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
+    if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
     dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
   };
 
@@ -2375,7 +2430,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
                     <td style={{...S.tdR,color:pnl>=0?"#7CFFB2":"#FF7A7A"}}>{pnl>=0?"+":""}${fmt(pnl,2)} ({fmtPct(pnlPct)})</td>
                     <td style={S.td}>
                       <button onClick={async()=>{
-                        const ok=await closeAlpacaPos(p.symbol,credsRef.current);
+                        const ok=await closeAlpacaPos(p.symbol,credsRef.current,parseFloat(p.current_price||p.avg_entry_price||0));
                         if(!ok)setAlpacaErrors(prev=>[{t:Date.now(),msg:`Manual close failed for ${p.symbol}`},...prev.slice(0,9)]);
                       }} style={{background:"#0d0d0d",border:"1px solid #FF7A7A",color:"#FF7A7A",padding:"2px 8px",fontSize:9,cursor:"pointer",fontFamily:"inherit"}}>FORCE CLOSE</button>
                     </td>
@@ -2387,7 +2442,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
               <button onClick={async()=>{
                 if(!confirm(`Force-close all ${orphaned.length} orphaned positions on Alpaca? This cancels any pending orders and sells everything.`))return;
                 for(const p of orphaned){
-                  try{await closeAlpacaPos(p.symbol,credsRef.current);}catch(e){}
+                  try{await closeAlpacaPos(p.symbol,credsRef.current,parseFloat(p.current_price||p.avg_entry_price||0));}catch(e){}
                 }
               }} style={{background:"#FF7A7A",border:"none",color:"#000",padding:"6px 12px",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>🚨 PANIC CLOSE ALL ORPHANED</button>
               <span style={{fontSize:10,color:"#5a5a5a"}}>Cancels pending orders, then liquidates positions Alpaca-side.</span>
