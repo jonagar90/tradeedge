@@ -63,6 +63,10 @@ const DEFAULT_SETTINGS = {
   // Data feed: "iex" = free (partial, stale on thin penny stocks) | "sip" = Algo Trader Plus
   // ($99/mo, consolidated tape = real prices on penny stocks). Flip to "sip" AFTER subscribing.
   dataFeed:"iex",
+  // Must-be-rising filter — rejects dead/fading setups (the MFE-0% losses). Default ON.
+  mustBeRisingEnabled:true,
+  risingLookback:3,            // candles to inspect for upward slope
+  risingMaxBelowVwapPct:15,    // reject if price collapsed >15% below VWAP (falling knife)
   // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
   preMarketEnabled:false,        // master toggle, default OFF — opt-in
   preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
@@ -273,6 +277,40 @@ function isHoldingEma9(candles1m,ema9Current,priceNow,lookback=5){
   const allClosesHeld=recent.every(c=>c.close>=ema9Current*0.998);
   if(!allClosesHeld)return false;
   return true;
+}
+
+/* ================================================================
+   MUST-BE-RISING FILTER — reject dead/fading setups before entry
+   ================================================================
+   The problem it solves: a stock can gap +196%, run, then COLLAPSE and chop
+   sideways. Once it stabilizes, VWAP catches up to the dead price, so "above VWAP"
+   checks pass — but there's no live momentum. Every such entry shows MFE 0% (the
+   price never ticks up after entry; you bought the top of a dead move).
+
+   isRising() requires GENUINE upward movement over the last few candles:
+     1. The current price must be at/near the recent high (breaking out, not fading)
+     2. The recent closes must show a rising slope (last close > first close in window)
+     3. Price must not be collapsing far below VWAP (catches the RMSG falling-knife case)
+   Returns {rising:bool, reason:string}.
+*/
+function isRising(price,candles1m,vwap,opts){
+  const o=opts||{};
+  const lookback=o.lookback||3;          // candles to inspect
+  const maxBelowVwapPct=o.maxBelowVwapPct||15; // reject if price is >15% below VWAP (collapse)
+  const closes=(candles1m||[]).slice(-lookback).map(c=>c.close).filter(c=>c>0);
+  if(closes.length<2)return{rising:true,reason:"insufficient candles (allow)"}; // don't block on thin data
+  // (3) Collapse guard: price far below VWAP = falling knife (RMSG was 52% below VWAP)
+  if(vwap>0){
+    const belowVwapPct=((vwap-price)/vwap)*100;
+    if(belowVwapPct>maxBelowVwapPct)return{rising:false,reason:`Collapsed ${belowVwapPct.toFixed(0)}% below VWAP (falling knife)`};
+  }
+  // (1) Must be at/near the recent high — within 0.5% of the highest close in the window
+  const recentHigh=Math.max(...closes);
+  if(price<recentHigh*0.995)return{rising:false,reason:`Fading ${(((recentHigh-price)/recentHigh)*100).toFixed(1)}% off recent high (not rising)`};
+  // (2) Recent slope must be up — last close >= first close (allow tiny noise tolerance)
+  const first=closes[0],last=closes[closes.length-1];
+  if(last<first*0.997)return{rising:false,reason:`Recent closes falling ($${first.toFixed(4)}→$${last.toFixed(4)})`};
+  return{rising:true,reason:"rising"};
 }
 
 /* ================================================================
@@ -547,6 +585,11 @@ function checkEntry(ticker,s){
     if(rsi>(s.preMarketRsiMax||75))return{pass:false,reason:`PM RSI ${rsi.toFixed(0)} > ${s.preMarketRsiMax||75}`};
     // Must be near or breaking the premarket high (momentum confirmation), not fading from it
     if(d.pmHigh>0&&d.price<d.pmHigh*0.97)return{pass:false,reason:`Faded ${(((d.pmHigh-d.price)/d.pmHigh)*100).toFixed(1)}% off PM high`};
+    // Must-be-rising: reject dead/fading setups (MFE-0% losses). Uses premarket candles + pmVwap.
+    if(s.mustBeRisingEnabled){
+      const r=isRising(d.price,d.candles1m,d.pmVwap,{lookback:s.risingLookback,maxBelowVwapPct:s.risingMaxBelowVwapPct});
+      if(!r.rising)return{pass:false,reason:`Not rising: ${r.reason}`};
+    }
     return{pass:true,rsi,rvol:d.rvol,gapPct:d.gapPct,strategy:"PRE",score:Math.max(d.score,75),vwap:d.pmVwap,ema9:d.ema9,pmExtPct};
   }
 
@@ -1965,6 +2008,16 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         if(!check.pass){
           setScanLog(p=>[{t:nowIso(),ticker,reason:check.reason},...p.slice(0,49)]);
           continue;
+        }
+        // Must-be-rising gate for RTH lanes (IGNITION/INTRADAY/etc). PRE is already gated inside
+        // checkEntry with premarket VWAP, so skip it here to avoid double-checking.
+        if(s.mustBeRisingEnabled&&check.strategy!=="PRE"){
+          const dd=getMkt(ticker);
+          const r=isRising(dd.price,dd.candles1m,dd.vwap,{lookback:s.risingLookback,maxBelowVwapPct:s.risingMaxBelowVwapPct});
+          if(!r.rising){
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`Not rising: ${r.reason}`},...p.slice(0,49)]);
+            continue;
+          }
         }
         const d=getMkt(ticker);
         // snapshotPx = price seen when the entry decision was made. We use this to size and
