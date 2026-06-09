@@ -67,6 +67,11 @@ const DEFAULT_SETTINGS = {
   mustBeRisingEnabled:true,
   risingLookback:3,            // candles to inspect for upward slope
   risingMaxBelowVwapPct:15,    // reject if price collapsed >15% below VWAP (falling knife)
+  // VWAP_STOP buffer — how far below VWAP price must sit before the stop counts a tick.
+  // Premarket oscillates around VWAP as normal noise, so it needs a MUCH wider buffer than RTH,
+  // or the bot gets shaken out in 60 seconds on a 1% wiggle (CHAI/SUNE/ABAT pattern).
+  vwapStopBufferPct:0.2,       // regular hours: tight 0.2%
+  vwapStopBufferPctPre:1.5,    // premarket: wide 1.5% (room to breathe through the noise)
   // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
   preMarketEnabled:false,        // master toggle, default OFF — opt-in
   preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
@@ -1967,12 +1972,15 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         }
       }
 
-      // (5) VWAP stop — 3 consecutive ticks below VWAP. Applies pre-runner too.
+      // (5) VWAP stop — 3 consecutive ticks below VWAP by more than the buffer. Pre-runner too.
       // CRITICAL: only applies if the trade ENTERED above VWAP. If you entered below VWAP
       // (e.g. a dip-buy scalp where VWAP sits high from an earlier premarket spike), VWAP was
       // never your support — so "losing" it is meaningless and would kick the runner out instantly,
       // before it can run. Those trades rely on structural SL + EMA trail instead.
-      if(!hit&&trade.enteredAboveVwap&&d.vwap>0&&px<d.vwap*0.998){
+      // The buffer is WIDER in premarket: price oscillates around VWAP as normal noise there, so a
+      // tight 0.2% buffer ejects good trades in 60s (CHAI/SUNE/ABAT). Premarket gets ~1.5% of room.
+      const vwapStopBuf=(est.isPreMarket?(s.vwapStopBufferPctPre||1.5):(s.vwapStopBufferPct||0.2))/100;
+      if(!hit&&trade.enteredAboveVwap&&d.vwap>0&&px<d.vwap*(1-vwapStopBuf)){
         counter.vwapBelow++;counter.rvolLow=0;counter.redCandles=0;
         if(counter.vwapBelow>=3){hit="VWAP_STOP";resetCounter(trade.ticker);}
       }
