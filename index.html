@@ -72,6 +72,10 @@ const DEFAULT_SETTINGS = {
   // or the bot gets shaken out in 60 seconds on a 1% wiggle (CHAI/SUNE/ABAT pattern).
   vwapStopBufferPct:0.2,       // regular hours: tight 0.2%
   vwapStopBufferPctPre:1.5,    // premarket: wide 1.5% (room to breathe through the noise)
+  // Expansion-bar confirmation — entry candle must show range + volume expansion.
+  // Targets the MFE-0% dead-top entries (41% of trades, -$143 in the 56-trade audit).
+  expansionBarEnabled:true,
+  expansionRangeMult:1.5,      // trigger candle range must be >= 1.5x avg of prior 3
   // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
   preMarketEnabled:false,        // master toggle, default OFF — opt-in
   preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
@@ -100,8 +104,10 @@ const DEFAULT_SETTINGS = {
   breakPreMarketHigh:true,
   // --- Intraday Momentum (10:30am-3:00pm lane, different criteria) ---
   intradayMomentumEnabled:true,
-  intradayMinRvol:6,
-  intradayMaxVwapExt:8,        // max % above VWAP (anti-chase)
+  intradayMinRvol:10,          // TIGHTENED 6→10 (lane was 25% win, -$32.70; midday needs exceptional volume)
+  intradayMaxVwapExt:5,        // TIGHTENED 8→5: max % above VWAP (anti-chase — SUNE entered extended)
+  intradayRsiMax:72,           // RSI ceiling (was 78 hardcoded — no overbought chases)
+  intradayMinScore:78,         // score floor — INTRADAY must be A-grade to fire
   intradayBreakoutPct:0.3,     // % above last-hour high to confirm breakout
   intradayAvoidDeadZone:true,  // skip 11:30-1:30 unless RVOL is exceptional
   intradayDeadZoneRvolOverride:15, // RVOL needed to trade during dead zone
@@ -282,6 +288,36 @@ function isHoldingEma9(candles1m,ema9Current,priceNow,lookback=5){
   const allClosesHeld=recent.every(c=>c.close>=ema9Current*0.998);
   if(!allClosesHeld)return false;
   return true;
+}
+
+/* ================================================================
+   EXPANSION-BAR CONFIRMATION — the anti-"dead top" entry filter
+   ================================================================
+   Data finding (56-trade audit): 41% of trades had MFE=0% — price never ticked up
+   after entry — totaling -$143. Signature: entry on FLAT candles near a high (the
+   move already exhausted). A real breakout shows RANGE EXPANSION and VOLUME at the
+   moment of entry, not just proximity to a level.
+   Requires: trigger candle range >= rangeMult × avg range of prior 3 candles,
+   AND trigger candle volume > prior candle volume.
+*/
+function hasExpansionBar(candles1m,opts){
+  const o=opts||{};
+  const rangeMult=o.rangeMult||1.5;
+  const cs=candles1m||[];
+  if(cs.length<4)return{ok:true,reason:"insufficient candles (allow)"}; // don't block on thin data
+  const last=cs[cs.length-1];
+  const prior=cs.slice(-4,-1); // the 3 candles before the trigger candle
+  const avgRange=prior.reduce((a,c)=>a+Math.max(0,(c.high||0)-(c.low||0)),0)/prior.length;
+  const lastRange=Math.max(0,(last.high||0)-(last.low||0));
+  if(avgRange<=0)return{ok:true,reason:"flat priors (allow)"}; // no baseline to compare
+  if(lastRange<avgRange*rangeMult){
+    return{ok:false,reason:`No range expansion (${(lastRange/avgRange).toFixed(1)}x < ${rangeMult}x avg)`};
+  }
+  const prevVol=prior[prior.length-1].volume||0;
+  if((last.volume||0)<=prevVol){
+    return{ok:false,reason:`No volume expansion (${(last.volume||0).toLocaleString()} <= ${prevVol.toLocaleString()})`};
+  }
+  return{ok:true,reason:"expansion confirmed"};
 }
 
 /* ================================================================
@@ -800,11 +836,12 @@ function checkEntry(ticker,s){
         recentCandles.length>=30&&
         lastHourHigh>0&&
         d.price>lastHourHigh*(1+(s.intradayBreakoutPct||0.3)/100)&&  // breaking last-hour high
-        d.rvol>=(s.intradayMinRvol||6)&&                              // volume re-expansion
+        d.rvol>=(s.intradayMinRvol||10)&&                             // TIGHTENED 6→10: volume must be exceptional midday
         d.vwap>0&&d.price>d.vwap&&                                    // above VWAP (trending)
-        vwapExt<=(s.intradayMaxVwapExt||8)&&                          // not over-extended
+        vwapExt<=(s.intradayMaxVwapExt||5)&&                          // TIGHTENED 8→5: extension = chasing = SUNE
         d.ema9>0&&d.ema21>0&&d.ema9>d.ema21&&                         // EMA bullish
-        rsi>=55&&rsi<=78;                                             // RSI sweet spot
+        rsi>=55&&rsi<=(s.intradayRsiMax||72)&&                        // TIGHTENED ceiling 78→72: no overbought chases
+        (d.score||0)>=(s.intradayMinScore||78);                       // NEW: real score floor (was forced to 72 after pass)
       if(isIntradayMomentum){
         return{
           pass:true,
@@ -812,7 +849,7 @@ function checkEntry(ticker,s){
           rvol:d.rvol,
           gapPct:d.gapPct,
           strategy:"INTRADAY",
-          score:Math.max(d.score||0,72),
+          score:Math.max(d.score||0,78),
           vwap:d.vwap,
           ema9:d.ema9
         };
@@ -2082,6 +2119,17 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
             continue;
           }
         }
+        // EXPANSION-BAR gate — ALL lanes including PRE. The trigger candle must show range
+        // expansion AND volume expansion. A breakout without expansion is a dead top: 41% of
+        // audited trades entered on flat candles near a high and never ticked green (MFE=0%).
+        if(s.expansionBarEnabled){
+          const de=getMkt(ticker);
+          const ex=hasExpansionBar(de.candles1m,{rangeMult:s.expansionRangeMult});
+          if(!ex.ok){
+            setScanLog(p=>[{t:nowIso(),ticker,reason:`🧯 ${ex.reason}`},...p.slice(0,49)]);
+            continue;
+          }
+        }
         const d=getMkt(ticker);
         // snapshotPx = price seen when the entry decision was made. We use this to size and
         // pre-compute SL, but the ACTUAL fill price from Alpaca will replace `px` after the
@@ -2819,6 +2867,12 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="EXIT RVOL" value={settings.rvolExit} min={1} max={10} step={0.5} onChange={v=>set("rvolExit",v)}/>
           <NumField label="PRICE MIN $" value={settings.priceMin} min={0.01} max={50} step={0.1} onChange={v=>set("priceMin",v)}/>
           <NumField label="PRICE MAX $" value={settings.priceMax} min={1} max={1000} step={1} onChange={v=>set("priceMax",v)}/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.expansionBarEnabled} onChange={e=>set("expansionBarEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>EXPANSION-BAR CONFIRMATION</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Entry candle must show range + volume expansion. Blocks dead-top entries (MFE-0% pattern: 41% of audited trades, -$143).</div>
+          <NumField label="EXPANSION RANGE MULT" value={settings.expansionRangeMult} min={1} max={4} step={0.1} onChange={v=>set("expansionRangeMult",v)} help="trigger candle range vs avg of prior 3. Default 1.5x"/>
         </SettingGroup>
         <SettingGroup title="EXITS — 3-STAGE SCALE-OUT">
           <div style={{fontSize:9,color:"#7CFFB2",marginBottom:6,lineHeight:1.4}}>Stage 1 takes initial profit + moves SL to breakeven. Stage 2 locks in profit + moves SL up. Stage 3 (runner) trails on EMA9 to catch big moves.</div>
@@ -2891,6 +2945,8 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Midday lane (10:30am-3:00pm). Catches breakouts after the ignition window closes. Uses last-hour high instead of premarket high.</div>
           <NumField label="MIN RVOL" value={settings.intradayMinRvol} min={2} max={30} step={1} onChange={v=>set("intradayMinRvol",v)} help="minimum relative volume"/>
           <NumField label="MAX VWAP EXTENSION %" value={settings.intradayMaxVwapExt} min={2} max={20} step={1} onChange={v=>set("intradayMaxVwapExt",v)} help="anti-chase — reject if price >N% above VWAP"/>
+          <NumField label="RSI MAX" value={settings.intradayRsiMax} min={60} max={85} step={1} onChange={v=>set("intradayRsiMax",v)} help="ceiling — no overbought chases. Default 72"/>
+          <NumField label="MIN SCORE" value={settings.intradayMinScore} min={70} max={95} step={1} onChange={v=>set("intradayMinScore",v)} help="INTRADAY must be A-grade. Default 78"/>
           <NumField label="BREAKOUT % ABOVE LAST-HOUR HIGH" value={settings.intradayBreakoutPct} min={0.1} max={2} step={0.1} onChange={v=>set("intradayBreakoutPct",v)} help="breakout confirmation buffer"/>
           <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
             <input type="checkbox" checked={!!settings.intradayAvoidDeadZone} onChange={e=>set("intradayAvoidDeadZone",e.target.checked)} style={{cursor:"pointer"}}/>
