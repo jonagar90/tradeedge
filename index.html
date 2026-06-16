@@ -76,6 +76,14 @@ const DEFAULT_SETTINGS = {
   // Targets the MFE-0% dead-top entries (41% of trades, -$143 in the 56-trade audit).
   expansionBarEnabled:true,
   expansionRangeMult:1.5,      // trigger candle range must be >= 1.5x avg of prior 3
+  // Open-transition grace: a position opened in premarket gets a brief SL reprieve at 9:30,
+  // because the first ~45s of the regular session is the noisiest minute of the day (opening
+  // auction, gapping spreads, indicators resetting). JRSH 6/16 was stopped at 09:30:13 on
+  // open noise, then ran. Grace suppresses the SOFT hard-SL during the window, but a genuine
+  // collapse past emergencyPct still exits.
+  openGraceEnabled:true,
+  openGraceSecs:45,            // suppress soft SL for first 45s after the open
+  openGraceEmergencyPct:8,     // ...unless price is >8% below entry (real disaster — still exit)
   // ── PREMARKET STRATEGY (Option C — dedicated indicators + limit orders) ──
   preMarketEnabled:false,        // master toggle, default OFF — opt-in
   preMarketStartHour:7,          // begin premarket trading at 7:00 AM ET (more liquidity than 4am)
@@ -231,6 +239,7 @@ const getMkt=t=>{
     vwapBelowCount:0,rvolLowCount:0,redCandleCount:0,
     // partial exit tracking
     partialDone:false,
+    pendingClose:false,   // true while an Alpaca close order is in flight (prevents duplicate close orders / orphans)
     source:"alpaca",
   };
   return mktData[t];
@@ -1409,13 +1418,26 @@ async function sellAlpacaShares(ticker,qty,creds,curPrice){
 }
 
 async function closeAlpacaPos(ticker,creds,curPrice){
-  // FIRST: cancel any pending orders on this symbol so Alpaca doesn't reject with "opposite order exists"
+  // STEP 1: cancel any pending orders on this symbol, then VERIFY they're gone. A leftover
+  // unfilled premarket limit order causes Alpaca to reject the close with 422/403
+  // ("opposite side order exists" / "insufficient qty") — this is what orphaned JRSH/OBAI.
   await cancelOrdersForTicker(ticker,creds);
-  // Extended hours: DELETE /v2/positions sends a MARKET order, which Alpaca rejects premarket (422).
-  // So in extended hours we must place an explicit extended-hours LIMIT sell for the full position.
+  // Verify no open orders remain (poll up to ~2s) before attempting the close
+  for(let i=0;i<4;i++){
+    try{
+      const oR=await fetch(`${PROXY}/v2/orders?status=open&symbols=${ticker}`,{headers:aH(creds)});
+      if(oR.ok){
+        const orders=await oR.json();
+        if(!Array.isArray(orders)||orders.length===0)break; // clear
+        // still pending — cancel again and wait
+        await cancelOrdersForTicker(ticker,creds);
+      }
+    }catch(e){}
+    await new Promise(res=>setTimeout(res,500));
+  }
+  // STEP 2: extended hours — place an explicit extended-hours marketable LIMIT sell.
   if(inExtendedHours()&&curPrice>0){
     try{
-      // Find out how many shares we actually hold
       const posR=await fetch(`${PROXY}/v2/positions/${ticker}`,{headers:aH(creds)});
       if(posR.ok){
         const pos=await posR.json();
@@ -1434,18 +1456,24 @@ async function closeAlpacaPos(ticker,creds,curPrice){
         return true; // no position to close
       }
     }catch(e){}
-    // fall through to DELETE attempt as a last resort
   }
-  // THEN (RTH, or extended-hours fallback): close the remaining position via DELETE /v2/positions/{ticker}
-  // This closes whatever quantity is left, even if it differs from what the bot expected.
-  for(let i=0;i<3;i++){
+  // STEP 3: RTH (or extended-hours fallback): DELETE the position (market close).
+  // More retries than before, and we VERIFY the position is actually gone at the end —
+  // returning true ONLY if Alpaca confirms no position remains.
+  for(let i=0;i<5;i++){
     try{
       const r=await fetch(`${PROXY}/v2/positions/${ticker}`,{method:"DELETE",headers:aH(creds)});
       if(r.ok||r.status===404)return true;
     }catch(e){}
-    await new Promise(res=>setTimeout(res,500));
+    await new Promise(res=>setTimeout(res,600));
   }
-  return false;
+  // STEP 4: final verification — maybe the close actually worked despite a noisy response.
+  // Only report success if the position is truly gone.
+  try{
+    const checkR=await fetch(`${PROXY}/v2/positions/${ticker}`,{headers:aH(creds)});
+    if(checkR.status===404)return true; // position gone = closed
+  }catch(e){}
+  return false; // could NOT confirm close — caller keeps position & retries (no orphan)
 }
 // Module-level data feed selector, kept in sync with settings.dataFeed by a useEffect below.
 // "iex" = free partial feed; "sip" = paid Algo Trader Plus consolidated feed.
@@ -1907,17 +1935,30 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       // EOD force-close — highest priority, overrides min-hold and everything else
       if(isEodWindow){
         const closePrice=px;
-        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed EOD close ${trade.ticker}`},...p.slice(0,9)]);});
-        const isLoss=closePrice<trade.entry;
-        if(isLoss){
-          const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
-          setDailyLoss(dl=>{const nl=dl+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
-          updateRegime("LOSS");setRegimeState(regime.current);
+        const finalizeEod=()=>{
+          const isLoss=closePrice<trade.entry;
+          if(isLoss){
+            const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
+            setDailyLoss(dl=>{const nl=dl+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
+            updateRegime("LOSS");setRegimeState(regime.current);
+          } else {
+            updateRegime("WIN");setRegimeState(regime.current);
+          }
+          resetCounter(trade.ticker);
+          dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:"EOD_CLOSE",t:now});
+        };
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+          if(!getMkt(trade.ticker).pendingClose){
+            getMkt(trade.ticker).pendingClose=true;
+            closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{
+              getMkt(trade.ticker).pendingClose=false;
+              if(ok)finalizeEod();
+              else setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ EOD CLOSE FAILED ${trade.ticker} — still OPEN on Alpaca, will retry`},...p.slice(0,9)]);
+            }).catch(()=>{getMkt(trade.ticker).pendingClose=false;});
+          }
         } else {
-          updateRegime("WIN");setRegimeState(regime.current);
+          finalizeEod();
         }
-        resetCounter(trade.ticker);
-        dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:"EOD_CLOSE",t:now});
         continue;
       }
       if(holdMs<60000)continue; // min 60s hold (skipped for EOD above)
@@ -1994,7 +2035,26 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       //     - Before Stage 1: SL = entry × (1 - 1.5%) [original SL]
       //     - After Stage 1: SL = entry [breakeven]
       //     - After Stage 2: SL = Stage 1 price [profit locked]
-      else if(px<=trade.sl){hit="SL";resetCounter(trade.ticker);}
+      // OPEN-TRANSITION GRACE: if this position was opened premarket and we're in the first
+      // openGraceSecs of the regular session, suppress the soft SL through the open-auction
+      // noise — UNLESS price has truly collapsed past openGraceEmergencyPct below entry.
+      // This stops the "carried-in premarket position stopped at 09:30:13 then runs" loss (JRSH).
+      else if(px<=trade.sl){
+        // Was this position opened during premarket (before 9:30 today)?
+        const openedMs=new Date(trade.openedAt).getTime();
+        const nowD=new Date();
+        const openBell=new Date(nowD); openBell.setHours(9,30,0,0); // today's 9:30 ET assuming app runs in ET
+        const enteredPremarket=openedMs<openBell.getTime();
+        // Seconds since the regular-session open (only meaningful once market is open)
+        const secsSinceOpen=est.isMarketOpen?(est.minsFromOpen*60+nowD.getSeconds()):99999;
+        const inOpenGrace=s.openGraceEnabled&&est.isMarketOpen&&enteredPremarket&&secsSinceOpen<=(s.openGraceSecs||45);
+        const emergencyHit=px<=trade.entry*(1-(s.openGraceEmergencyPct||8)/100);
+        if(inOpenGrace&&!emergencyHit){
+          // Hold through the opening-auction noise — do not trigger the soft SL yet.
+        } else {
+          hit="SL";resetCounter(trade.ticker);
+        }
+      }
 
       // (3) RSI exhaustion — only fires on the runner (after Stage 2), when momentum is overheating
       else if(trade.stage2Done&&calcRSI(d.priceHistory)>=(s.runnerRsiExit||82)){
@@ -2040,17 +2100,45 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
       if(hit){
         const closePrice=px;
-        if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
-        const isLoss=closePrice<trade.entry;
-        if(isLoss){
-          const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
-          setDailyLoss(d=>{const nl=d+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
-          getMkt(trade.ticker).slHits++;getMkt(trade.ticker).lastSlTime=Date.now();
-          updateRegime("LOSS");setRegimeState(regime.current);
+        const finalizeClose=()=>{
+          const isLoss=closePrice<trade.entry;
+          if(isLoss){
+            const loss=Math.abs((closePrice-trade.entry)/trade.entry*trade.size);
+            setDailyLoss(d=>{const nl=d+loss;if(nl>=settingsRef.current.dailyLossLimit)setCircuitBreaker(true);return nl;});
+            getMkt(trade.ticker).slHits++;getMkt(trade.ticker).lastSlTime=Date.now();
+            updateRegime("LOSS");setRegimeState(regime.current);
+          } else {
+            updateRegime("WIN");setRegimeState(regime.current);
+          }
+          dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
+        };
+        if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+          // CRITICAL: do NOT mark the position closed until Alpaca CONFIRMS the close.
+          // Previously the bot dispatched CLOSE immediately while the close order was still
+          // in flight — so a 422/403 rejection left the shares ORPHANED on Alpaca (bot thinks
+          // flat, Alpaca still holds the position with no stop watching it). That's an
+          // account-blower with real money. Now: only finalize on success; on failure keep the
+          // position in bot state (so it retries the close next tick) and flag it loudly.
+          // The pendingClose guard stops us from firing a new close order every tick while one
+          // is still being attempted.
+          if(!getMkt(trade.ticker).pendingClose){
+            getMkt(trade.ticker).pendingClose=true;
+            closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{
+              getMkt(trade.ticker).pendingClose=false;
+              if(ok){
+                finalizeClose();
+              } else {
+                setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ CLOSE FAILED ${trade.ticker} — position still OPEN on Alpaca, will retry. Check Drift panel.`},...p.slice(0,9)]);
+              }
+            }).catch(()=>{
+              getMkt(trade.ticker).pendingClose=false;
+              setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ CLOSE ERROR ${trade.ticker} — will retry next tick`},...p.slice(0,9)]);
+            });
+          }
         } else {
-          updateRegime("WIN");setRegimeState(regime.current);
+          // Simulated mode — no broker, finalize immediately
+          finalizeClose();
         }
-        dispatch({type:"CLOSE",tradeId:trade.id,closePrice,reason:hit,t:now});
       }
     }
   },[tickerData]);
@@ -2334,8 +2422,17 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
   const manualClose=(trade)=>{
     const px=priceRef.current[trade.ticker]??trade.entry;
     resetCounter(trade.ticker);
-    if(modeRef.current==="alpaca"&&connStatus.state==="connected")closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{if(!ok)setAlpacaErrors(p=>[{t:Date.now(),msg:`failed close ${trade.ticker}`},...p.slice(0,9)]);});
-    dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
+    if(modeRef.current==="alpaca"&&connStatus.state==="connected"){
+      closeAlpacaPos(trade.ticker,credsRef.current,px).then(ok=>{
+        if(ok){
+          dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
+        } else {
+          setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ MANUAL CLOSE FAILED ${trade.ticker} — still OPEN on Alpaca. Use Drift panel FORCE CLOSE.`},...p.slice(0,9)]);
+        }
+      }).catch(()=>setAlpacaErrors(p=>[{t:Date.now(),msg:`⚠ MANUAL CLOSE ERROR ${trade.ticker}`},...p.slice(0,9)]));
+    } else {
+      dispatch({type:"CLOSE",tradeId:trade.id,closePrice:px,reason:"MANUAL",t:Date.now()});
+    }
   };
 
   const stats=useMemo(()=>{
