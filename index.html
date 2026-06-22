@@ -185,10 +185,10 @@ function updateRegime(result){
   else{regime.current="TRENDING";}
 }
 
-function getRegimeMultiplier(){
+function getRegimeMultiplier(brakeOn){
   if(regime.current==="TRENDING")return 1.0;
-  if(regime.current==="CHOPPY")return 0.5;
-  if(regime.current==="NO_TRADE")return 0;
+  if(regime.current==="CHOPPY")return brakeOn?0.5:1.0;
+  if(regime.current==="NO_TRADE")return brakeOn?0:1.0;
   // Initial "UNKNOWN" state — before any wins/losses have occurred.
   // Previously returned 0, which silently zeroed out position size and blocked all trades.
   // Default to full size (1.0) until regime adjusts based on actual results.
@@ -2282,7 +2282,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
         // Risk-based position sizing — uses ACTUAL SL distance, not the fixed setting.
         // This guarantees we never risk more than riskPct% of balance per trade,
         // even when structural SL placed the stop wider than the fixed 1.5%.
-        const riskAmt=balance*(s.riskPct/100)*getRegimeMultiplier();
+        const riskAmt=balance*(s.riskPct/100)*getRegimeMultiplier(s.regimeBrakeEnabled);
         const slDist=px-sl; // dollars per share at risk
         const calcSize=slDist>0?(riskAmt/slDist)*px:s.maxTradeSize;
         const size=Math.min(calcSize,s.maxTradeSize,balance*0.05);
