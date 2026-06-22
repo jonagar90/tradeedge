@@ -44,6 +44,18 @@ const DEFAULT_SETTINGS = {
   tpFinalPct:25,      // hard cap on runner (was 8% — too tight for winners)
   runnerNoProgressMins:30,   // exit runner if no new high in N minutes
   runnerRsiExit:82,          // exit runner on RSI overbought
+  // === GROK RUNNER (isolated, opt-in) — governs the final runner slice ONLY when enabled ===
+  grokRunnerEnabled:false,           // master ON/OFF; OFF = existing runner exits unchanged
+  runnerTrailType:"ATR_DYNAMIC",     // "PCT" | "ATR_DYNAMIC" | "EMA9_HYBRID"
+  runnerTrailATRMultiplier:3.5,      // trail = runnerHigh − (ATR × mult); wide = more room to run
+  runnerTrailPct:12,                 // PCT-mode fallback trail distance
+  runnerTightenAfterPct:25,          // past +25%, halve trail distance to protect gains
+  runnerRsiScaleOut:88,              // exit runner on RSI exhaustion (looser than the 82 default)
+  runnerVolumeFadeExit:true,         // exit if RVOL collapses on the runner
+  runnerVolumeFadeRvol:1.5,          // RVOL floor for fade exit
+  runnerVolumeFadeTicks:5,           // sustained ticks below floor before exiting
+  runnerMaxHoldMins:180,             // hard max hold for the runner slice
+  grokRunnerMaxPct:50,               // hard profit ceiling so a parabolic eventually books (0 = uncapped)
   slPct:1.5,          // legacy fixed % SL — only used as fallback when structural SL has no data
   // === Structural Stop-Loss (anchored to VWAP / swing low instead of arbitrary %) ===
   // Stops "noise stops" — placing SL based on real price action, not a flat percentage.
@@ -425,6 +437,28 @@ function calcATR(candles,period=14){
     return Math.max(c.high-c.low,Math.abs(c.high-prev.close),Math.abs(c.low-prev.close));
   });
   return trs.reduce((a,b)=>a+b,0)/trs.length;
+}
+
+// GROK RUNNER — dynamic trailing-stop price, anchored to the running peak (not entry).
+// Gives wide room early so runners aren't shaken out, then tightens past the threshold to
+// protect gains. Only ever called from the Grok runner block (opt-in); existing exits untouched.
+function calcDynamicTrail(trade,d,px,s){
+  const peak=trade.runnerHigh||px;
+  const uplPct=((px-trade.entry)/trade.entry)*100;
+  const tighten=uplPct>=(s.runnerTightenAfterPct||25);   // bank gains once well in profit
+  if(s.runnerTrailType==="PCT"){
+    const pct=(tighten?(s.runnerTrailPct||12)/2:(s.runnerTrailPct||12))/100;
+    return peak*(1-pct);
+  }
+  if(s.runnerTrailType==="EMA9_HYBRID"){
+    const mult=tighten?(s.runnerTrailATRMultiplier||3.5)/2:(s.runnerTrailATRMultiplier||3.5);
+    const atrTrail=d.atr>0?peak-d.atr*mult:peak*0.88;
+    const ema9Floor=d.ema9>0?d.ema9*0.985:0;             // once price rides EMA9, trail it
+    return Math.max(atrTrail,ema9Floor);                  // tighter of the two governs
+  }
+  // ATR_DYNAMIC (default)
+  const mult=tighten?(s.runnerTrailATRMultiplier||3.5)/2:(s.runnerTrailATRMultiplier||3.5);
+  return d.atr>0?peak-d.atr*mult:peak*0.88;               // 12% fallback when ATR unavailable
 }
 
 function updateMkt(ticker,price,volume,prevClose,open){
@@ -946,6 +980,11 @@ function buildTradeReport(trade,tradeIndex){
   if(trade.reason==="MANUAL")observations.push("△ Manually closed by user");
   if(trade.reason==="RSI_EXIT")observations.push("✓ RSI overbought (≥82) — exited runner before reversal");
   if(trade.reason==="NO_PROGRESS")observations.push("△ Runner went flat 30+ min without new high — capital opportunity cost");
+  if(trade.reason==="GROK_TRAIL")observations.push("✓ Grok dynamic trail — runner ran, then exited as price fell off its peak");
+  if(trade.reason==="GROK_RSI")observations.push("✓ Grok RSI exhaustion exit — momentum overheated on the runner");
+  if(trade.reason==="GROK_VOL_FADE")observations.push("△ Grok volume-fade exit — RVOL collapsed on the runner");
+  if(trade.reason==="GROK_MAXHOLD")observations.push("△ Grok max-hold reached — runner slice timed out");
+  if(trade.reason==="GROK_CAP")observations.push("✓ Grok hard cap — runner booked at the profit ceiling");
   if(mfePct>=1.5&&trade.pnlPct<0.3)observations.push(`? MFE was +${mfePct.toFixed(2)}% but exit was only ${trade.pnlPct.toFixed(2)}% — consider tighter trailing stop`);
   if(maePct<=-1&&isWin)observations.push(`? MAE went to ${maePct.toFixed(2)}% before recovering — entry timing could be earlier`);
   if(holdSec<120&&!isWin)observations.push("? Stopped out fast (<2min) — likely chasing or noise entry");
@@ -2029,6 +2068,36 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       // 7. RVOL fade — momentum dying off
       // ═══════════════════════════════════════════════════════════════════
 
+      // ═══════════════════════════════════════════════════════════════════
+      // GROK RUNNER (opt-in) — governs the runner slice ONLY when enabled & past Stage 2.
+      // Safety SL runs FIRST (structural SL preserved). Replaces the soft runner exits below
+      // with a dynamic peak-anchored trail so true runners can stretch toward grokRunnerMaxPct
+      // while weak ones (RSI exhaustion / volume collapse / no follow-through) get cut fast.
+      // When OFF — or before Stage 2 — the original (1)-(7) chain in the else runs unchanged.
+      // ═══════════════════════════════════════════════════════════════════
+      if(s.grokRunnerEnabled&&trade.stage2Done){
+        const gUplPct=((px-trade.entry)/trade.entry)*100;
+        if(px<=trade.sl){ hit="SL";resetCounter(trade.ticker); }                              // safety first
+        else if(s.grokRunnerMaxPct>0&&gUplPct>=s.grokRunnerMaxPct){ hit="GROK_CAP";resetCounter(trade.ticker); }
+        else {
+          const gTrail=calcDynamicTrail(trade,d,px,s);
+          if(gTrail>trade.sl)trade.sl=gTrail;                                                 // ratchet SL up only
+          const gRsi=calcRSI(d.priceHistory);
+          if(px<=gTrail){ hit="GROK_TRAIL";resetCounter(trade.ticker); }                      // fell off the peak
+          else if(gRsi>=(s.runnerRsiScaleOut||88)){ hit="GROK_RSI";resetCounter(trade.ticker); }
+          else if(s.runnerVolumeFadeExit&&d.rvol>0&&d.rvol<(s.runnerVolumeFadeRvol||1.5)){
+            trade.grokVolLow=(trade.grokVolLow||0)+1;
+            if(trade.grokVolLow>=(s.runnerVolumeFadeTicks||5)){ hit="GROK_VOL_FADE";resetCounter(trade.ticker); }
+          } else {
+            trade.grokVolLow=0;
+            const gHeldMins=(now-new Date(trade.openedAt).getTime())/60000;
+            if(gHeldMins>=(s.runnerMaxHoldMins||180)){ hit="GROK_MAXHOLD";resetCounter(trade.ticker); }
+            else resetCounter(trade.ticker);
+          }
+        }
+      }
+      else {
+
       // (1) Hard cap on runner
       if(px>=trade.entry*(1+s.tpFinalPct/100)){hit="TP_FINAL";resetCounter(trade.ticker);}
 
@@ -2098,6 +2167,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       }
 
       else if(!hit){resetCounter(trade.ticker);}
+      } // end else (existing runner chain — Grok Runner OFF or pre-Stage-2)
 
       if(hit){
         const closePrice=px;
@@ -3040,6 +3110,34 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="DAILY LOSS LIMIT $" value={settings.dailyLossLimit} min={50} max={10000} step={50} onChange={v=>set("dailyLossLimit",v)}/>
           <NumField label="COOLDOWN AFTER SL (ms)" value={settings.cooldownMs} min={300000} max={7200000} step={300000} onChange={v=>set("cooldownMs",v)} help="30min default"/>
           <NumField label="POST-EXIT COOLDOWN (mins)" value={(settings.postExitCooldownMs||300000)/60000} min={1} max={60} step={1} onChange={v=>set("postExitCooldownMs",v*60000)} help="prevents re-entry on a ticker we JUST exited. Default 5 min."/>
+        </SettingGroup>
+        <SettingGroup title="🚀 GROK RUNNER">
+          <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>Opt-in runner maximizer. Governs ONLY the final runner slice (after Stage 2). When OFF, the existing runner exits run exactly as before.</div>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={!!settings.grokRunnerEnabled} onChange={e=>set("grokRunnerEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>GROK RUNNER ENABLED</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>When ON: replaces the soft runner exits (RSI/EMA9/VWAP/no-progress/+25% cap) with a dynamic peak-anchored trail. Structural SL still applies first.</div>
+          <label style={{display:"flex",flexDirection:"column",gap:2,marginTop:6}}>
+            <span style={styles.fieldLabel}>TRAIL TYPE</span>
+            <select value={settings.runnerTrailType} onChange={e=>set("runnerTrailType",e.target.value)} style={{background:"#1a1a1a",color:"#e8e8e8",border:"1px solid #333",borderRadius:4,padding:"4px 6px",fontSize:11,cursor:"pointer"}}>
+              <option value="ATR_DYNAMIC">ATR_DYNAMIC</option>
+              <option value="EMA9_HYBRID">EMA9_HYBRID</option>
+              <option value="PCT">PCT</option>
+            </select>
+          </label>
+          <NumField label="TRAIL ATR MULTIPLIER" value={settings.runnerTrailATRMultiplier} min={1} max={8} step={0.5} onChange={v=>set("runnerTrailATRMultiplier",v)} help="trail = peak − ATR×mult. Wider = more room. Default 3.5."/>
+          <NumField label="TRAIL % (PCT mode)" value={settings.runnerTrailPct} min={3} max={30} step={1} onChange={v=>set("runnerTrailPct",v)} help="fallback % trail in PCT mode. Default 12."/>
+          <NumField label="TIGHTEN AFTER %" value={settings.runnerTightenAfterPct} min={5} max={100} step={5} onChange={v=>set("runnerTightenAfterPct",v)} help="past this gain, halve the trail to bank profit. Default 25."/>
+          <NumField label="RSI SCALE-OUT" value={settings.runnerRsiScaleOut} min={75} max={95} step={1} onChange={v=>set("runnerRsiScaleOut",v)} help="exit runner on RSI exhaustion. Default 88."/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
+            <input type="checkbox" checked={!!settings.runnerVolumeFadeExit} onChange={e=>set("runnerVolumeFadeExit",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>VOLUME-FADE EXIT</span>
+          </label>
+          <NumField label="VOL-FADE RVOL FLOOR" value={settings.runnerVolumeFadeRvol} min={0.5} max={5} step={0.1} onChange={v=>set("runnerVolumeFadeRvol",v)} help="exit if RVOL drops below this. Default 1.5."/>
+          <NumField label="VOL-FADE TICKS" value={settings.runnerVolumeFadeTicks} min={2} max={20} step={1} onChange={v=>set("runnerVolumeFadeTicks",v)} help="sustained low-RVOL ticks before exit. Default 5."/>
+          <NumField label="MAX HOLD (mins)" value={settings.runnerMaxHoldMins} min={15} max={390} step={15} onChange={v=>set("runnerMaxHoldMins",v)} help="hard max hold for the runner slice. Default 180."/>
+          <NumField label="HARD CAP % (0=uncapped)" value={settings.grokRunnerMaxPct} min={0} max={200} step={5} onChange={v=>set("grokRunnerMaxPct",v)} help="book the runner at this gain. 0 = let it run. Default 50."/>
         </SettingGroup>
         <SettingGroup title="🧪 TESTING MODE">
           <div style={{fontSize:9,color:"#FFB627",marginBottom:6,lineHeight:1.4}}>Turn these OFF to maximize trade volume while testing. Turn back ON for real trading.</div>
