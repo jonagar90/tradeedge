@@ -44,6 +44,10 @@ const DEFAULT_SETTINGS = {
   tpFinalPct:25,      // hard cap on runner (was 8% — too tight for winners)
   runnerNoProgressMins:30,   // exit runner if no new high in N minutes
   runnerRsiExit:82,          // exit runner on RSI overbought
+  // === PROVE-IT MICRO-STOP — scratch pre-Stage-1 entries that never tick green ===
+  proveItEnabled:true,       // ON: exit at scratch if entry shows no life by proveItSecs
+  proveItSecs:75,            // seconds after entry the trade must have shown life by
+  proveItMinMfePct:0.4,      // minimum MFE% required by then, else NO_LIFE exit
   // === GROK RUNNER (isolated, opt-in) — governs the final runner slice ONLY when enabled ===
   grokRunnerEnabled:false,           // master ON/OFF; OFF = existing runner exits unchanged
   runnerTrailType:"ATR_DYNAMIC",     // "PCT" | "ATR_DYNAMIC" | "EMA9_HYBRID"
@@ -980,6 +984,7 @@ function buildTradeReport(trade,tradeIndex){
   if(trade.reason==="MANUAL")observations.push("△ Manually closed by user");
   if(trade.reason==="RSI_EXIT")observations.push("✓ RSI overbought (≥82) — exited runner before reversal");
   if(trade.reason==="NO_PROGRESS")observations.push("△ Runner went flat 30+ min without new high — capital opportunity cost");
+  if(trade.reason==="NO_LIFE")observations.push("✂ Prove-it scratch — entry showed no follow-through, cut before full SL");
   if(trade.reason==="GROK_TRAIL")observations.push("✓ Grok dynamic trail — runner ran, then exited as price fell off its peak");
   if(trade.reason==="GROK_RSI")observations.push("✓ Grok RSI exhaustion exit — momentum overheated on the runner");
   if(trade.reason==="GROK_VOL_FADE")observations.push("△ Grok volume-fade exit — RVOL collapsed on the runner");
@@ -2057,6 +2062,22 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       let hit=null;
 
       // ═══════════════════════════════════════════════════════════════════
+      // PROVE-IT MICRO-STOP (pre-Stage-1 only) — a momentum entry that hasn't
+      // ticked green by proveItSecs has no follow-through. Scratch it now instead
+      // of riding the full structural SL. Data: 18 MFE<0.3% entries lost -$51 at
+      // full stop; this converts the slow flat-to-down bleeders into ~scratch exits.
+      // Only fires before Stage 1 — once the position has banked a partial it has proven itself.
+      // ═══════════════════════════════════════════════════════════════════
+      if(s.proveItEnabled && !trade.partialDone){
+        const piSecs=holdMs/1000;
+        const piMfe=(((trade.maxPrice||trade.entry)-trade.entry)/trade.entry)*100;
+        if(piSecs>=(s.proveItSecs||75) && piMfe<(s.proveItMinMfePct||0.4)){
+          hit="NO_LIFE"; resetCounter(trade.ticker);
+        }
+      }
+
+
+      // ═══════════════════════════════════════════════════════════════════
       // STAGE 3 (RUNNER) — only the remaining ~30% of position lives here
       // Multiple exit triggers, prioritized:
       // 1. Hard cap (TP_FINAL) — runner reaches very high target
@@ -2075,6 +2096,8 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
       // while weak ones (RSI exhaustion / volume collapse / no follow-through) get cut fast.
       // When OFF — or before Stage 2 — the original (1)-(7) chain in the else runs unchanged.
       // ═══════════════════════════════════════════════════════════════════
+      // Skip the runner/exit chain entirely if a prior check (e.g. NO_LIFE) already set hit.
+      if(!hit){
       if(s.grokRunnerEnabled&&trade.stage2Done){
         const gUplPct=((px-trade.entry)/trade.entry)*100;
         if(px<=trade.sl){ hit="SL";resetCounter(trade.ticker); }                              // safety first
@@ -2168,6 +2191,7 @@ return{...prev,[sym]:next};});}}}}catch(err){}};ws.onerror=()=>setWsStatus("erro
 
       else if(!hit){resetCounter(trade.ticker);}
       } // end else (existing runner chain — Grok Runner OFF or pre-Stage-2)
+      } // end if(!hit) guard — prove-it / prior exits short-circuit the chain
 
       if(hit){
         const closePrice=px;
@@ -3094,6 +3118,13 @@ function SettingsDrawer({settings,onChange,onReset,onClose,creds,onCredsChange,c
           <NumField label="RUNNER HARD CAP %" value={settings.tpFinalPct} min={5} max={100} step={1} onChange={v=>set("tpFinalPct",v)} help="full exit if runner reaches this. Default 25%."/>
           <NumField label="RUNNER RSI EXIT" value={settings.runnerRsiExit} min={70} max={95} step={1} onChange={v=>set("runnerRsiExit",v)} help="exit runner if RSI overheats. Default 82."/>
           <NumField label="RUNNER NO-PROGRESS MINS" value={settings.runnerNoProgressMins} min={5} max={120} step={5} onChange={v=>set("runnerNoProgressMins",v)} help="exit runner if N min without new high. Default 30."/>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
+            <input type="checkbox" checked={!!settings.proveItEnabled} onChange={e=>set("proveItEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
+            <span style={styles.fieldLabel}>PROVE-IT MICRO-STOP</span>
+          </label>
+          <div style={{fontSize:9,color:"#5a5a5a",marginTop:-4,marginBottom:4,lineHeight:1.4}}>Scratch a pre-Stage-1 entry that hasn't ticked green by the window — kills dead-on-arrival entries before they ride the full SL.</div>
+          <NumField label="PROVE-IT WINDOW (secs)" value={settings.proveItSecs} min={30} max={300} step={15} onChange={v=>set("proveItSecs",v)} help="entry must show life within N sec. Default 75. (60s min-hold applies first.)"/>
+          <NumField label="PROVE-IT MIN MFE %" value={settings.proveItMinMfePct} min={0.1} max={3} step={0.1} onChange={v=>set("proveItMinMfePct",v)} help="min peak gain required by the window, else scratch. Default 0.4."/>
           <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginTop:8}}>
             <input type="checkbox" checked={!!settings.structuralSlEnabled} onChange={e=>set("structuralSlEnabled",e.target.checked)} style={{cursor:"pointer"}}/>
             <span style={styles.fieldLabel}>STRUCTURAL SL ENABLED</span>
